@@ -1,0 +1,39 @@
+# Virtual environment
+.cenv/
+.venv/
+venv/
+
+# Environment variables / API keys
+.env
+.env.*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
+
+# LangGraph / application generated files
+checkpoints/
+storage/
+data/
+
+# Secrets / local files
+secrets/
