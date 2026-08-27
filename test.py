@@ -190,18 +190,6 @@ while True:
         ]
     },
     config=config,
-    stream_mode=["messages", "updates"]
-    ):
-
-        mode, data = chunk
-
-        if mode == "messages":
-            message_chunk, metadata = data
-
-            if isinstance(message_chunk, AIMessage):
-                if message_chunk.content:
-                    print(message_chunk.content, end="", flush=True)
-
-        elif mode == "updates":
-            print("\nUPDATE:", data)
-    print()
+    stream_mode="updates"
+):
+        print(chunk)
