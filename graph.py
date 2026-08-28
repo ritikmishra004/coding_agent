@@ -20,7 +20,7 @@ def list_files()->list[str]:
     "List all files and folder in the current project directory"
     files = []
     for path in Path(".").iterdir():
-        if path.name in [".cenv", "__pycache__", ".git", ".env"]:
+        if path.name in [".cenv", "__pycache__", ".git", ".env","checkpoints.db"]:
             continue
         else:
             files.append(path.name)
@@ -64,13 +64,19 @@ def command_run(command):
         text = True
     )
     return result.stdout + result.stderr
+
+@tool
+def test_error() -> str:
+    """Test tool error handling."""
+    raise ValueError("Something went wrong inside the tool")
 #===========================tools======================================
 tools =[
     list_files,
     read_file,
     write_file,
     edit_file,
-    command_run
+    command_run,
+    test_error
 ]
 #===========================LLM======================================
 gemini = ChatGoogleGenerativeAI(
@@ -134,13 +140,20 @@ def should_continue(state: AgentState):
         return "tool"
     return END
 
+def handle_tool_error(error: Exception) -> str:
+    return f"❌ Tool failed: {str(error)}"
+
+
 tool_node = ToolNode([
     list_files,
     read_file,
     write_file,
     edit_file,
-    command_run
-])
+    command_run,
+    test_error
+    ],
+    handle_tool_errors=handle_tool_error
+)
 
 # ============================================================
 # 7. GRAPH
@@ -163,7 +176,7 @@ graph.add_conditional_edges("agent",should_continue)
 graph.add_edge("tool", "agent")
 
 app = graph.compile(checkpointer=checkpointer)
-
+# ==========================================================================
 thread_id = str(uuid.uuid4())
 
 config = {
@@ -171,7 +184,7 @@ config = {
         "thread_id": thread_id
     }
 }
-
+# ==========================================================================
 while True:
     user_input = input("You: ")
     if user_input.lower() in ["bye","exit","quit"]:
@@ -184,24 +197,47 @@ while True:
     failed_providers.clear()
 
     for chunk in app.stream(
-    {
-        "messages": [
-            HumanMessage(content=user_input)
-        ]
-    },
-    config=config,
-    stream_mode=["messages", "updates"]
+        {
+            "messages": [
+                HumanMessage(content=user_input)
+            ]
+        },
+        config=config,
+        stream_mode=["messages", "updates"]
     ):
 
         mode, data = chunk
 
+        # =========================
+        # AI MESSAGE STREAM
+        # =========================
         if mode == "messages":
+
             message_chunk, metadata = data
+
+            if isinstance(message_chunk, ToolMessage):
+                continue
 
             if isinstance(message_chunk, AIMessage):
                 if message_chunk.content:
                     print(message_chunk.content, end="", flush=True)
 
+        # =========================
+        # GRAPH UPDATES
+        # =========================
         elif mode == "updates":
-            print("\nUPDATE:", data)
+
+            update = data
+
+            # Agent ne tool call kiya
+            if "agent" in update:
+
+                message = update["agent"]["messages"][-1]
+
+                if isinstance(message, AIMessage):
+
+                    if message.tool_calls:
+                        for tool_call in message.tool_calls:
+                            print(
+                                f"\n🔧 Using tool: {tool_call['name']}")
     print()
