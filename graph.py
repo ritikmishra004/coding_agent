@@ -14,6 +14,7 @@ from langgraph.graph.message import add_messages
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 import os
+from langgraph.types import interrupt, Command
 
 @tool
 def list_files()->list[str]:
@@ -65,18 +66,14 @@ def command_run(command):
     )
     return result.stdout + result.stderr
 
-@tool
-def test_error() -> str:
-    """Test tool error handling."""
-    raise ValueError("Something went wrong inside the tool")
+
 #===========================tools======================================
 tools =[
     list_files,
     read_file,
     write_file,
     edit_file,
-    command_run,
-    test_error
+    command_run
 ]
 #===========================LLM======================================
 gemini = ChatGoogleGenerativeAI(
@@ -121,10 +118,14 @@ def get_llm_response(messages):
 
     raise Exception("All LLM providers failed.")
 
-
+#===================================================================================
 
 class AgentState(BaseModel):
-    messages: Annotated[list[BaseMessage],add_messages]
+    messages: Annotated[list[BaseMessage], add_messages]
+    approval: str | None = None
+    # CHANGE: approval ko state mein store kar rahe hain,
+    # taaki human ka yes/no decision approval node se
+    # next routing function tak available rahe.
 
 def agent(state: AgentState):
     """LLM node that will answer"""
@@ -135,13 +136,74 @@ def agent(state: AgentState):
     }
 
 def should_continue(state: AgentState):
-    last_message= state.messages[-1]
-    if last_message.tool_calls:
+    last_message = state.messages[-1]
+
+    if not last_message.tool_calls:
+        return END
+
+    dangerous_tools = {
+        "write_file",
+        "edit_file",
+        "command_run"
+    }
+
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] in dangerous_tools:
+            return "approval"
+
+    return "tool"
+
+def human_approval(state: AgentState):
+    last_message = state.messages[-1]
+
+    tool_call = last_message.tool_calls[0]
+
+    approval = interrupt(
+        f"""
+⚠️ Approval required
+
+Tool: {tool_call["name"]}
+
+Arguments:
+{tool_call["args"]}
+"""
+    )
+
+    if approval.lower() == "yes":
+        return {
+            "approval": "yes"
+        }
+        # CHANGE: yes/no decision ko state mein save kar rahe hain.
+        # Isse after_approval() directly state.approval se
+        # decide kar sakta hai ki tool chalana hai ya nahi.
+
+    return {
+        "approval": "no",
+        "messages": [
+            ToolMessage(
+                content="Tool execution rejected by the user.",
+                tool_call_id=tool_call["id"]
+            )
+        ]
+    }
+    # CHANGE: no par ToolMessage add kiya hai.
+    # Agent ko clear tool-result milega ki user ne execution reject kiya.
+    # Isse agent original tool call ko simply ignore karke
+    # rejection ko samajh sakta hai.
+
+def after_approval(state: AgentState):
+
+    if state.approval.lower() == "yes":
         return "tool"
-    return END
+
+    return "agent"
+    # CHANGE: ab routing approval field ke basis par ho rahi hai.
+    # yes → actual ToolNode
+    # no  → Agent, taaki user ko rejection ka proper response mil sake.
+
 
 def handle_tool_error(error: Exception) -> str:
-    return f"❌ Tool failed: {str(error)}"
+    return f"Tool failed: {str(error)}"
 
 
 tool_node = ToolNode([
@@ -149,8 +211,7 @@ tool_node = ToolNode([
     read_file,
     write_file,
     edit_file,
-    command_run,
-    test_error
+    command_run
     ],
     handle_tool_errors=handle_tool_error
 )
@@ -164,14 +225,25 @@ conn = sqlite3.connect(
 )
 checkpointer = SqliteSaver(conn)
 graph = StateGraph(AgentState)
+
 # Nodes
 graph.add_node("agent", agent)
 graph.add_node("tool", tool_node)
+graph.add_node("approval", human_approval)
 
 # START → AGENT
 graph.add_edge(START, "agent")
 # AGENT ke baad decision
-graph.add_conditional_edges("agent",should_continue)
+graph.add_conditional_edges("agent", should_continue)
+# APPROVAL → TOOL / AGENT
+graph.add_conditional_edges(
+    "approval",
+    after_approval
+)
+# CHANGE: approval ke baad fixed "tool" edge hata kar
+# conditional routing use kar rahe hain,
+# kyunki yes par tool aur no par agent jaana hai.
+
 # TOOL → AGENT
 graph.add_edge("tool", "agent")
 
@@ -187,57 +259,94 @@ config = {
 # ==========================================================================
 while True:
     user_input = input("You: ")
-    if user_input.lower() in ["bye","exit","quit"]:
+
+    if user_input.lower() in ["bye", "exit", "quit"]:
         break
 
-    if user_input.lower() == "/new":
-        thread_id = str(uuid.uuid4())
-
-    # Har new user request ke liye providers ko fresh try karenge
     failed_providers.clear()
 
-    for chunk in app.stream(
-        {
-            "messages": [
-                HumanMessage(content=user_input)
-            ]
-        },
-        config=config,
-        stream_mode=["messages", "updates"]
-    ):
+    input_data = {
+        "messages": [
+            HumanMessage(content=user_input)
+        ]
+    }
 
-        mode, data = chunk
+    while True:
+
+        interrupted = False
+
+        for chunk in app.stream(
+            input_data,
+            config=config,
+            stream_mode=["messages", "updates"]
+        ):
+            mode, data = chunk
+
+            # =========================
+            # AI MESSAGE STREAM
+            # =========================
+            if mode == "messages":
+
+                message_chunk, metadata = data
+
+                if isinstance(message_chunk, ToolMessage):
+                    continue
+
+                if isinstance(message_chunk, AIMessage):
+                    if message_chunk.content:
+                        print(
+                            message_chunk.content,
+                            end="",
+                            flush=True
+                        )
+
+            # =========================
+            # GRAPH UPDATES
+            # =========================
+            elif mode == "updates":
+
+                update = data
+
+                if "agent" in update:
+
+                    message = update["agent"]["messages"][-1]
+
+                    if isinstance(message, AIMessage):
+
+                        if message.tool_calls:
+                            for tool_call in message.tool_calls:
+                                print(
+                                    f"\n🔧 Using tool: "
+                                    f"{tool_call['name']}"
+                                )
+
+                # HITL INTERRUPT
+                if "__interrupt__" in update:
+
+                    interrupted = True
+
+                    interrupt_data = update["__interrupt__"][0]
+
+                    print(
+                        f"\n{interrupt_data.value}"
+                    )
+
+        print()
 
         # =========================
-        # AI MESSAGE STREAM
+        # RESUME AFTER APPROVAL
         # =========================
-        if mode == "messages":
+        if interrupted:
 
-            message_chunk, metadata = data
+            approval = input("Approve? (yes/no): ")
 
-            if isinstance(message_chunk, ToolMessage):
-                continue
+            input_data = Command(
+                resume=approval
+            )
+            # CHANGE: interrupt() par graph pause hone ke baad
+            # Command(resume=approval) wahi paused execution ko
+            # user ke yes/no answer ke saath resume karta hai.
 
-            if isinstance(message_chunk, AIMessage):
-                if message_chunk.content:
-                    print(message_chunk.content, end="", flush=True)
+            continue
 
-        # =========================
-        # GRAPH UPDATES
-        # =========================
-        elif mode == "updates":
-
-            update = data
-
-            # Agent ne tool call kiya
-            if "agent" in update:
-
-                message = update["agent"]["messages"][-1]
-
-                if isinstance(message, AIMessage):
-
-                    if message.tool_calls:
-                        for tool_call in message.tool_calls:
-                            print(
-                                f"\n🔧 Using tool: {tool_call['name']}")
-    print()
+        break

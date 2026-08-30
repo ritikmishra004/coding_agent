@@ -14,13 +14,14 @@ from langgraph.graph.message import add_messages
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 import os
+from langgraph.types import interrupt
 
 @tool
 def list_files()->list[str]:
     "List all files and folder in the current project directory"
     files = []
     for path in Path(".").iterdir():
-        if path.name in [".cenv", "__pycache__", ".git", ".env"]:
+        if path.name in [".cenv", "__pycache__", ".git", ".env","checkpoints.db"]:
             continue
         else:
             files.append(path.name)
@@ -64,6 +65,8 @@ def command_run(command):
         text = True
     )
     return result.stdout + result.stderr
+
+
 #===========================tools======================================
 tools =[
     list_files,
@@ -115,7 +118,7 @@ def get_llm_response(messages):
 
     raise Exception("All LLM providers failed.")
 
-
+#===================================================================================
 
 class AgentState(BaseModel):
     messages: Annotated[list[BaseMessage],add_messages]
@@ -129,10 +132,56 @@ def agent(state: AgentState):
     }
 
 def should_continue(state: AgentState):
-    last_message= state.messages[-1]
-    if last_message.tool_calls:
-        return "tool"
-    return END
+    last_message = state.messages[-1]
+
+    if not last_message.tool_calls:
+        return END
+
+    dangerous_tools = {
+        "write_file",
+        "edit_file",
+        "command_run"
+    }
+
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] in dangerous_tools:
+            return "approval"
+
+    return "tool"
+
+def human_approval(state: AgentState):
+    last_message = state.messages[-1]
+
+    tool_call = last_message.tool_calls[0]
+
+    approval = interrupt(
+        f"""
+⚠️ Approval required
+
+Tool: {tool_call["name"]}
+
+Arguments:
+{tool_call["args"]}
+
+Approve? Type yes/no
+"""
+    )
+
+    if approval.lower() == "yes":
+        return {
+            "messages": []
+        }
+
+    return {
+        "messages": [
+            HumanMessage(content="The user rejected the tool execution.")
+        ]
+    }
+
+
+def handle_tool_error(error: Exception) -> str:
+    return f"Tool failed: {str(error)}"
+
 
 tool_node = ToolNode([
     list_files,
@@ -140,7 +189,9 @@ tool_node = ToolNode([
     write_file,
     edit_file,
     command_run
-])
+    ],
+    handle_tool_errors=handle_tool_error
+)
 
 # ============================================================
 # 7. GRAPH
@@ -151,19 +202,23 @@ conn = sqlite3.connect(
 )
 checkpointer = SqliteSaver(conn)
 graph = StateGraph(AgentState)
+
 # Nodes
 graph.add_node("agent", agent)
 graph.add_node("tool", tool_node)
+graph.add_node("approval", human_approval)
 
 # START → AGENT
 graph.add_edge(START, "agent")
 # AGENT ke baad decision
-graph.add_conditional_edges("agent",should_continue)
+graph.add_conditional_edges("agent", should_continue)
+# APPROVAL → TOOL
+graph.add_edge("approval", "tool")
 # TOOL → AGENT
 graph.add_edge("tool", "agent")
 
 app = graph.compile(checkpointer=checkpointer)
-
+# ==========================================================================
 thread_id = str(uuid.uuid4())
 
 config = {
@@ -171,7 +226,7 @@ config = {
         "thread_id": thread_id
     }
 }
-
+# ==========================================================================
 while True:
     user_input = input("You: ")
     if user_input.lower() in ["bye","exit","quit"]:
@@ -184,12 +239,47 @@ while True:
     failed_providers.clear()
 
     for chunk in app.stream(
-    {
-        "messages": [
-            HumanMessage(content=user_input)
-        ]
-    },
-    config=config,
-    stream_mode="updates"
-):
-        print(chunk)
+        {
+            "messages": [
+                HumanMessage(content=user_input)
+            ]
+        },
+        config=config,
+        stream_mode=["messages", "updates"]
+    ):
+
+        mode, data = chunk
+
+        # =========================
+        # AI MESSAGE STREAM
+        # =========================
+        if mode == "messages":
+
+            message_chunk, metadata = data
+
+            if isinstance(message_chunk, ToolMessage):
+                continue
+
+            if isinstance(message_chunk, AIMessage):
+                if message_chunk.content:
+                    print(message_chunk.content, end="", flush=True)
+
+        # =========================
+        # GRAPH UPDATES
+        # =========================
+        elif mode == "updates":
+
+            update = data
+
+            # Agent ne tool call kiya
+            if "agent" in update:
+
+                message = update["agent"]["messages"][-1]
+
+                if isinstance(message, AIMessage):
+
+                    if message.tool_calls:
+                        for tool_call in message.tool_calls:
+                            print(
+                                f"\n🔧 Using tool: {tool_call['name']}")
+    print()
