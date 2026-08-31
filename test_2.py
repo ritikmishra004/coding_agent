@@ -4,7 +4,7 @@ from langchain_core.messages import BaseMessage,HumanMessage,AIMessage, ToolMess
 from pathlib import Path
 from langgraph.graph import StateGraph,START,END
 from typing import Annotated
-from pydantic import BaseModel
+from pydantic import BaseModel,Field
 import subprocess
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
@@ -118,12 +118,14 @@ def get_llm_response(messages):
 
     raise Exception("All LLM providers failed.")
 
+
 #===================================================================================
 
 class AgentState(BaseModel):
     messages: Annotated[list[BaseMessage],add_messages]
     approval: str | None = None
-    pending_tools: list[dict] = []
+    pending_tools: list[dict] = Field(default_factory=list)
+    approved_tool: dict | None = None
     # CHANGE: human ka yes/no decision state mein store hoga.
     # Approval node decision dega aur after_approval() isi value
     # ko read karke tool ya agent par route karega.
@@ -166,10 +168,17 @@ content, then call the required tool.
         "messages": [response]
     }
 
-def should_continue(state: AgentState):
+def classify_tools(state: AgentState):
+
     last_message = state.messages[-1]
 
-    if not last_message.tool_calls:
+    return {
+        "pending_tools": last_message.tool_calls
+    }
+
+def should_continue(state: AgentState):
+
+    if not state.pending_tools:
         return END
 
     dangerous_tools = {
@@ -178,16 +187,16 @@ def should_continue(state: AgentState):
         "command_run"
     }
 
-    for tool_call in last_message.tool_calls:
-        if tool_call["name"] in dangerous_tools:
-            return "approval"
+    next_tool = state.pending_tools[0]
 
-    return "tool"
+    if next_tool["name"] in dangerous_tools:
+        return "approval"
+
+    return "process"
 
 def human_approval(state: AgentState):
-    last_message = state.messages[-1]
 
-    tool_call = last_message.tool_calls[0]
+    tool_call = state.pending_tools[0]
 
     approval = interrupt(
         f"""
@@ -199,41 +208,71 @@ Arguments:
 """
     )
 
-    if approval.lower() == "yes":
+    return {
+        "approval": approval
+    }
+
+def process_approval(state: AgentState):
+
+    tool_call = state.pending_tools[0]
+    dangerous_tools = {
+        "write_file",
+        "edit_file",
+        "command_run"
+    }
+
+    if tool_call["name"] not in dangerous_tools:
         return {
-            "approval": "yes"
+            "approved_tool": tool_call,
+            "pending_tools": state.pending_tools[1:]
         }
-        # CHANGE: yes ko state mein store kar rahe hain.
-        # Isse after_approval() ko pata chalega ki
-        # ToolNode ko execute karna hai.
+
+    if state.approval == "yes":
+        return {
+            "approved_tool": tool_call,
+            "pending_tools": state.pending_tools[1:],
+            "approval": None
+        }
+
+    rejection_message = ToolMessage(
+        content=(
+            f"The user rejected the execution of "
+            f"the tool '{tool_call['name']}'. "
+            "Do not execute this tool call."
+        ),
+        tool_call_id=tool_call["id"]
+    )
 
     return {
-        "approval": "no",
-        "messages": [
-            ToolMessage(
-                content=(
-                    f"The user rejected the execution of "
-                    f"the tool '{tool_call['name']}'. "
-                    "Do not execute this tool call."
-                ),
-                tool_call_id=tool_call["id"]
-            )
-        ]
+        "approved_tool": None,
+        "pending_tools": state.pending_tools[1:],
+        "approval": None,
+        "messages": [rejection_message]
     }
-    # CHANGE: no par ToolMessage add kiya.
-    # Agent ko clear result milega ki user ne tool execution reject kiya.
-    # Actual tool execute nahi hoga.
 
-def after_approval(state: AgentState):
+def after_process(state: AgentState):
 
-    if state.approval.lower() == "yes":
-        return "tool"
+    if state.approved_tool:
+        return "execute"
+
+    if state.pending_tools:
+        return "approval"
 
     return "agent"
-    # CHANGE: approval ke result ke according routing.
-    # yes → ToolNode
-    # no  → Agent
 
+def execute_approved_tool(state: AgentState):
+
+    tool_call = state.approved_tool
+
+    message = AIMessage(
+        content="",
+        tool_calls=[tool_call]
+    )
+
+    return {
+        "messages": [message],
+        "approved_tool": None
+    }
 
 def handle_tool_error(error: Exception) -> str:
     return f"Tool failed: {str(error)}"
@@ -263,20 +302,38 @@ graph = StateGraph(AgentState)
 graph.add_node("agent", agent)
 graph.add_node("tool", tool_node)
 graph.add_node("approval", human_approval)
+graph.add_node("classify_tools", classify_tools)
+graph.add_node("process_approval", process_approval)
+graph.add_node("execute_approved_tool", execute_approved_tool)
 
 # START → AGENT
 graph.add_edge(START, "agent")
-# AGENT ke baad decision
-graph.add_conditional_edges("agent", should_continue)
-
-# APPROVAL → TOOL / AGENT
+# AGENT ke baad tools ko process karenge
+graph.add_edge("agent", "classify_tools")
 graph.add_conditional_edges(
-    "approval",
-    after_approval
+    "classify_tools",
+    should_continue,
+    {
+        "approval": "approval",
+        "process": "process_approval",
+        END: END
+    }
 )
-# CHANGE: approval ke baad fixed edge nahi hai.
-# yes → tool
-# no → agent
+
+# APPROVAL → PROCESS
+graph.add_edge("approval", "process_approval")
+
+graph.add_conditional_edges(
+    "process_approval",
+    after_process,
+    {
+        "execute": "execute_approved_tool",
+        "approval": "approval",
+        "agent": "agent"
+    }
+)
+
+graph.add_edge("execute_approved_tool", "tool")
 
 # TOOL → AGENT
 graph.add_edge("tool", "agent")
@@ -290,12 +347,15 @@ config = {
         "thread_id": thread_id
     }
 }
+
 # ==========================================================================
 while True:
+
     user_input = input("You: ")
 
     if user_input.lower() in ["bye","exit","quit"]:
         break
+
     if user_input.lower() == "/new":
         thread_id = str(uuid.uuid4())
         config = {
@@ -303,21 +363,28 @@ while True:
                 "thread_id": thread_id
             }
         }
-        # CHANGE: sirf thread_id change karna enough nahi hai.
+
+        # CHANGE:
+        # Sirf thread_id change karna enough nahi hai.
         # config mein bhi new thread_id dena zaroori hai,
         # warna checkpointing purane thread mein hi continue hogi.
         print("Started a new conversation.")
         continue
-        # CHANGE: /new ko agent ko user message ki tarah bhejne se rok rahe hain.
+
     # Har new user request ke liye providers ko fresh try karenge
     failed_providers.clear()
+
     input_data = {
         "messages": [
             HumanMessage(content=user_input)
         ],
-        "approval": None
+        "approval": None,
+        "pending_tools": [],
+        "approved_tool": None
     }
-    # CHANGE: har new user request par approval ko None kar rahe hain.
+
+    # CHANGE:
+    # Har new user request par approval ko None kar rahe hain.
     # Previous request ka yes/no next request mein reuse nahi hoga.
 
     while True:
@@ -327,10 +394,11 @@ while True:
         for chunk in app.stream(
             input_data,
             config=config,
-            stream_mode=["messages", "updates"]
+            stream_mode=["messages","updates"]
         ):
 
             mode, data = chunk
+
             # =========================
             # AI MESSAGE STREAM
             # =========================
@@ -343,26 +411,51 @@ while True:
 
                 if isinstance(message_chunk, AIMessage):
                     if message_chunk.content:
-                        print(message_chunk.content,end="",flush=True)
+                        print(
+                            message_chunk.content,
+                            end="",
+                            flush=True
+                        )
 
             # =========================
             # GRAPH UPDATES
             # =========================
+
             elif mode == "updates":
+
                 update = data
-                if "agent" in update:
-                    message = update["agent"]["messages"][-1]
+
+                if "execute_approved_tool" in update:
+
+                    tool_data = update[
+                        "execute_approved_tool"
+                    ]
+
+                    message = tool_data[
+                        "messages"
+                    ][0]
+
                     if isinstance(message, AIMessage):
+
                         if message.tool_calls:
+
                             for tool_call in message.tool_calls:
+
                                 print(
-                                    f"\n🔧 Using tool: {tool_call['name']}")
+                                    f"\n🔧 Using tool: {tool_call['name']}"
+                                )
+
                 # HITL INTERRUPT
                 if "__interrupt__" in update:
+
                     interrupted = True
-                    interrupt_data = update["__interrupt__"][0]
+
+                    interrupt_data = update[
+                        "__interrupt__"
+                    ][0]
+
                     print(
-                        f"\n{interrupt_data.value}"
+                        interrupt_data.value
                     )
 
         print()
@@ -370,19 +463,31 @@ while True:
         # =========================
         # RESUME AFTER APPROVAL
         # =========================
+
         if interrupted:
+
             while True:
+
                 approval = input("Approve? (yes/no): ").strip().lower()
-                if approval in ["yes", "no"]:
+
+                if approval in ["yes","no"]:
                     break
+
                 print("Please type yes or no.")
-            # CHANGE: invalid input handle kiya.
+
+            # CHANGE:
+            # Invalid input handle kiya.
             # Sirf yes/no par hi paused graph resume hoga.
+
             input_data = Command(
                 resume=approval
             )
-            # CHANGE: interrupt() se paused graph ko resume kar rahe hain.
-            # approval value human_approval() ke interrupt() ko return hogi.
+
+            # CHANGE:
+            # interrupt() se paused graph ko resume kar rahe hain.
+            # approval value human_approval() ke interrupt()
+            # ke return value ke roop mein receive hogi.
+
             continue
 
         break
