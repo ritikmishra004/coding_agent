@@ -14,6 +14,7 @@ from langgraph.graph.message import add_messages
 import sqlite3
 from langgraph.checkpoint.sqlite import SqliteSaver
 import os
+import shlex
 from langgraph.types import interrupt, Command
 
 @tool
@@ -27,12 +28,16 @@ def list_files()->list[str]:
             files.append(path.name)
     return files
 
-@tool 
+@tool
 def read_file(file_path: str) -> str:
     """Read the complete contents of a file."""
     path = Path(file_path)
+
     if not path.is_file():
-        return f"{file_path} is not a file."
+        raise FileNotFoundError(
+            f"{file_path} does not exist."
+        )
+
     return path.read_text()
 
 @ tool 
@@ -55,17 +60,98 @@ def edit_file(file_path,old_text,new_text):
     path.write_text(content)
     return f"{file_path} updated successfully"
 
+
+ALLOWED_COMMANDS = {
+    "ls",
+    "pwd",
+    "cat",
+    "find",
+    "grep",
+    "git status",
+    "git diff",
+    "git log",
+    "git branch",
+    "git switch",
+    "python",
+    "python3",
+    "pip",
+    "pytest",
+    "npm",
+    "npx",
+    "rm",
+    "mkdir",
+    "touch"
+}
+
+def allowed_command(command: str) -> bool:
+    try:
+        parts = shlex.split(command)
+
+        if not parts:
+            return False
+
+        base_command = parts[0]
+
+        if base_command == "git":
+            if len(parts) < 2:
+                return False
+
+            return f"git {parts[1]}" in {
+                "git status",
+                "git diff",
+                "git log",
+                "git branch",
+                "git switch"
+            }
+            # CHANGE:
+            # git switch ko bhi yahan add kiya hai.
+            # ALLOWED_COMMANDS mein pehle se tha,
+            # lekin git ke special check mein missing tha.
+
+        return base_command in ALLOWED_COMMANDS
+
+    except ValueError:
+        return False
+
+
 @tool
-def command_run(command):
+def command_run(command:str):
     """Run a terminal command in the current project directory."""
+
+    if not allowed_command(command):
+        return (
+            f"Command rejected by security policy: {command}\n"
+            "Do not retry this command or perform an alternative action "
+            "to achieve the same operation."
+        )
+
     result = subprocess.run(
         command,
         shell = True,
         capture_output=True,
-        text = True
+        text=True
     )
-    return result.stdout + result.stderr
 
+    output = result.stdout + result.stderr
+
+    if output:
+        return output
+    return f"✅ Command executed successfully: {command}"
+    # CHANGE:
+    # Pehle yahan sirf result.stdout + result.stderr return ho raha tha.
+    #
+    # rm, mkdir, touch jaise successful commands normally koi output
+    # nahi dete. Isliye empty string return ho rahi thi.
+    #
+    # Ab agar command successful hai lekin output empty hai,
+    # to LLM ko explicit confirmation milegi.
+    # Isse LLM ko ye clear rahega ki command execute ho chuki hai
+    # aur same command ko unnecessarily repeat nahi karna hai.
+
+@tool
+def test_retry_error():
+    """Testing tool for retry error handling."""
+    raise TimeoutError("Temporary timeout for testing retry logic.")
 
 #===========================tools======================================
 tools =[
@@ -73,17 +159,21 @@ tools =[
     read_file,
     write_file,
     edit_file,
-    command_run
+    command_run,
+    test_retry_error
 ]
+
 #===========================LLM======================================
 gemini = ChatGoogleGenerativeAI(
     model = "gemini-2.5-flash",
     temperature = 0
 )
+
 groq = ChatGroq(
     model="openai/gpt-oss-120b",
     temperature=0
 )
+
 nvidia=ChatOpenAI(
     model="openai/gpt-oss-120b",
     temperature=0,
@@ -94,11 +184,14 @@ nvidia=ChatOpenAI(
 gemini = gemini.bind_tools(tools)
 groq = groq.bind_tools(tools)
 nvidia = nvidia.bind_tools(tools)
+
 #========================= get llm =========================
 
 failed_providers = set()
+
 def get_llm_response(messages):
     providers = [("groq",groq),("gemini",gemini),("nvidia",nvidia)]
+
     for provider_name,llm in providers:
 
         # Agar provider pehle hi fail ho chuka hai,
@@ -111,8 +204,10 @@ def get_llm_response(messages):
             #print(f"Trying {provider_name}...")
             response=llm.invoke(messages)
             return response
+
         except Exception as e:
             print(f"{provider_name} failed: {e}")
+
             # Provider ko failed list mein remember kar lo
             failed_providers.add(provider_name)
 
@@ -126,9 +221,14 @@ class AgentState(BaseModel):
     approval: str | None = None
     pending_tools: list[dict] = Field(default_factory=list)
     approved_tool: dict | None = None
-    # CHANGE: human ka yes/no decision state mein store hoga.
-    # Approval node decision dega aur after_approval() isi value
-    # ko read karke tool ya agent par route karega.
+    error_type: str | None = None
+    retry_count: int = 0 
+
+    # CHANGE:
+    # Human ka yes/no decision state mein store hoga.
+    # Approval node decision dega aur process_approval() isi value
+    # ko read karke tool ya rejection ka decision karega.
+
 
 def agent(state: AgentState):
     """LLM node that will answer"""
@@ -150,17 +250,30 @@ Use:
 
 For file creation requests, determine the appropriate filename and
 content, then call the required tool.
+
+If a tool reports that an operation was rejected by a security policy,
+do not retry the same operation and do not use another tool to bypass
+the security restriction.
+
+If a tool reports that an operation was successfully completed,
+do not repeat the same operation unless the user explicitly asks
+you to perform it again.
+
+If a tool fails, analyze the error before taking the next action.
+Do not blindly retry the same failed tool call.
+If another available tool can help recover from the failure,
+use it when appropriate.
+Otherwise, explain the failure to the user.
 """
     )
-    # CHANGE: LLM ko coding-agent ka clear instruction de rahe hain.
-    # Pehle LLM user ke request ko sirf "code likhne" ka request samajh
-    # kar code chat mein de raha tha.
-    # Ab usse explicitly bataya hai ki file create/write karne ke liye
-    # actual tool use karna mandatory hai.
+
+    # CHANGE:
+    # Successful tool execution ke baad same operation ko repeat
+    # karne se LLM ko explicitly rok rahe hain.
+    # Ye command_run ke explicit success message ke saath milkar
+    # duplicate command execution ko reduce karta hai.
 
     message = [system_message] + state.messages
-    # CHANGE: SystemMessage ko conversation ke beginning mein add kiya.
-    # Isse LLM ko har agent call par ye instruction milega.
 
     response = get_llm_response(message)
 
@@ -186,18 +299,15 @@ def should_continue(state: AgentState):
         "edit_file",
         "command_run"
     }
-
     next_tool = state.pending_tools[0]
-
     if next_tool["name"] in dangerous_tools:
         return "approval"
-
     return "process"
+
 
 def human_approval(state: AgentState):
 
     tool_call = state.pending_tools[0]
-
     approval = interrupt(
         f"""
 Approval required
@@ -254,11 +364,10 @@ def after_process(state: AgentState):
 
     if state.approved_tool:
         return "execute"
-
     if state.pending_tools:
         return "approval"
-
     return "agent"
+
 
 def execute_approved_tool(state: AgentState):
 
@@ -274,8 +383,69 @@ def execute_approved_tool(state: AgentState):
         "approved_tool": None
     }
 
+
+def classify_error(error: Exception) -> str:
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return "retry"
+    if isinstance(error, (FileNotFoundError, PermissionError)):
+        return "agent"
+    return "stop"
+
+def check_tool_result(state: AgentState):
+    last_message = state.messages[-1]
+
+    if isinstance(last_message, ToolMessage):
+        if last_message.content.startswith("Tool failed:"):
+            error_name = last_message.content.split(":")[1].strip()
+
+            if error_name == "TimeoutError":
+                error = TimeoutError()
+            elif error_name == "ConnectionError":
+                error = ConnectionError()
+            elif error_name == "FileNotFoundError":
+                error = FileNotFoundError()
+            elif error_name == "PermissionError":
+                error = PermissionError()
+            else:
+                error = Exception()
+
+            decision = classify_error(error)
+
+            if decision == "retry":
+                if state.retry_count < 3:
+                    return {
+                        "error_type": "retry",
+                        "retry_count": state.retry_count + 1
+                    }
+
+                return {
+                    "error_type": "stop"
+                }
+
+            return {
+                "error_type": decision
+            }
+
+    return {
+        "error_type": None,
+        "retry_count": 0
+    }
+
+def after_tool_result(state: AgentState):
+
+    if state.error_type == "retry":
+        return "tool"
+
+    if state.error_type == "agent":
+        return "agent"
+
+    if state.error_type is None:
+        return "agent"
+
+    return END
+
 def handle_tool_error(error: Exception) -> str:
-    return f"Tool failed: {str(error)}"
+    return f"Tool failed: {type(error).__name__}: {str(error)}"
 
 
 tool_node = ToolNode([
@@ -283,19 +453,24 @@ tool_node = ToolNode([
     read_file,
     write_file,
     edit_file,
-    command_run
+    command_run,
+    test_retry_error
     ],
     handle_tool_errors=handle_tool_error
 )
 
+
 # ============================================================
 # 7. GRAPH
 # ============================================================
+
 conn = sqlite3.connect(
     "checkpoints.db",
     check_same_thread=False
 )
+
 checkpointer = SqliteSaver(conn)
+
 graph = StateGraph(AgentState)
 
 # Nodes
@@ -306,10 +481,16 @@ graph.add_node("classify_tools", classify_tools)
 graph.add_node("process_approval", process_approval)
 graph.add_node("execute_approved_tool", execute_approved_tool)
 
+# CHANGE:
+# Tool execute hone ke baad uske result/error ko check karenge.
+graph.add_node("check_tool_result", check_tool_result)
+
 # START → AGENT
 graph.add_edge(START, "agent")
+
 # AGENT ke baad tools ko process karenge
 graph.add_edge("agent", "classify_tools")
+
 graph.add_conditional_edges(
     "classify_tools",
     should_continue,
@@ -335,8 +516,25 @@ graph.add_conditional_edges(
 
 graph.add_edge("execute_approved_tool", "tool")
 
-# TOOL → AGENT
-graph.add_edge("tool", "agent")
+# CHANGE:
+# Pehle:
+# tool → agent
+#
+# Ab:
+# tool → check_tool_result
+graph.add_edge("tool", "check_tool_result")
+
+# CHANGE:
+# Tool result ke according next node decide hoga.
+graph.add_conditional_edges(
+    "check_tool_result",
+    after_tool_result,
+    {
+        "tool": "tool",
+        "agent": "agent",
+        END: END
+    }
+)
 
 app = graph.compile(checkpointer=checkpointer)
 # ==========================================================================
@@ -363,30 +561,29 @@ while True:
                 "thread_id": thread_id
             }
         }
-
         # CHANGE:
         # Sirf thread_id change karna enough nahi hai.
         # config mein bhi new thread_id dena zaroori hai,
-        # warna checkpointing purane thread mein hi continue hogi.
+        # warna checkpointing purane thread mein continue hogi.
         print("Started a new conversation.")
         continue
 
     # Har new user request ke liye providers ko fresh try karenge
     failed_providers.clear()
-
     input_data = {
         "messages": [
             HumanMessage(content=user_input)
         ],
         "approval": None,
         "pending_tools": [],
-        "approved_tool": None
+        "approved_tool": None,
+        "error_type": None,
+        "retry_count": 0
     }
 
     # CHANGE:
     # Har new user request par approval ko None kar rahe hain.
     # Previous request ka yes/no next request mein reuse nahi hoga.
-
     while True:
 
         interrupted = False
@@ -398,7 +595,6 @@ while True:
         ):
 
             mode, data = chunk
-
             # =========================
             # AI MESSAGE STREAM
             # =========================
@@ -408,7 +604,6 @@ while True:
 
                 if isinstance(message_chunk, ToolMessage):
                     continue
-
                 if isinstance(message_chunk, AIMessage):
                     if message_chunk.content:
                         print(
@@ -416,6 +611,7 @@ while True:
                             end="",
                             flush=True
                         )
+
 
             # =========================
             # GRAPH UPDATES
@@ -427,37 +623,18 @@ while True:
 
                 if "execute_approved_tool" in update:
 
-                    tool_data = update[
-                        "execute_approved_tool"
-                    ]
-
-                    message = tool_data[
-                        "messages"
-                    ][0]
-
+                    tool_data = update["execute_approved_tool"]
+                    message = tool_data["messages"][0]
                     if isinstance(message, AIMessage):
-
                         if message.tool_calls:
-
                             for tool_call in message.tool_calls:
-
-                                print(
-                                    f"\n🔧 Using tool: {tool_call['name']}"
-                                )
+                                print(f"\n🔧 Using tool: {tool_call['name']}")
 
                 # HITL INTERRUPT
                 if "__interrupt__" in update:
-
                     interrupted = True
-
-                    interrupt_data = update[
-                        "__interrupt__"
-                    ][0]
-
-                    print(
-                        interrupt_data.value
-                    )
-
+                    interrupt_data = update["__interrupt__"][0]
+                    print(interrupt_data.value)
         print()
 
         # =========================
@@ -469,25 +646,16 @@ while True:
             while True:
 
                 approval = input("Approve? (yes/no): ").strip().lower()
-
                 if approval in ["yes","no"]:
                     break
-
                 print("Please type yes or no.")
-
             # CHANGE:
             # Invalid input handle kiya.
             # Sirf yes/no par hi paused graph resume hoga.
-
-            input_data = Command(
-                resume=approval
-            )
-
+            input_data = Command(resume=approval)
             # CHANGE:
             # interrupt() se paused graph ko resume kar rahe hain.
             # approval value human_approval() ke interrupt()
             # ke return value ke roop mein receive hogi.
-
             continue
-
         break
