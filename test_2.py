@@ -32,12 +32,6 @@ def list_files()->list[str]:
 def read_file(file_path: str) -> str:
     """Read the complete contents of a file."""
     path = Path(file_path)
-
-    if not path.is_file():
-        raise FileNotFoundError(
-            f"{file_path} does not exist."
-        )
-
     return path.read_text()
 
 @ tool 
@@ -221,8 +215,9 @@ class AgentState(BaseModel):
     approval: str | None = None
     pending_tools: list[dict] = Field(default_factory=list)
     approved_tool: dict | None = None
+    failed_tool_call: dict | None = None
     error_type: str | None = None
-    retry_count: int = 0 
+    retry_count: int = 0
 
     # CHANGE:
     # Human ka yes/no decision state mein store hoga.
@@ -365,7 +360,17 @@ def after_process(state: AgentState):
     if state.approved_tool:
         return "execute"
     if state.pending_tools:
-        return "approval"
+        dangerous_tools = {
+            "write_file",
+            "edit_file",
+            "command_run"
+        }
+
+        if state.pending_tools[0]["name"] in dangerous_tools:
+            return "approval"
+
+        return "process"
+
     return "agent"
 
 
@@ -391,12 +396,34 @@ def classify_error(error: Exception) -> str:
         return "agent"
     return "stop"
 
+def retry_tool(state: AgentState):
+    return {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[state.failed_tool_call]
+            )
+        ]
+    }
+
 def check_tool_result(state: AgentState):
     last_message = state.messages[-1]
 
     if isinstance(last_message, ToolMessage):
         if last_message.content.startswith("Tool failed:"):
             error_name = last_message.content.split(":")[1].strip()
+
+            failed_tool_call = None
+
+            for message in reversed(state.messages):
+                if isinstance(message, AIMessage):
+                    for tool_call in message.tool_calls:
+                        if tool_call["id"] == last_message.tool_call_id:
+                            failed_tool_call = tool_call
+                            break
+
+                if failed_tool_call:
+                    break
 
             if error_name == "TimeoutError":
                 error = TimeoutError()
@@ -415,7 +442,8 @@ def check_tool_result(state: AgentState):
                 if state.retry_count < 3:
                     return {
                         "error_type": "retry",
-                        "retry_count": state.retry_count + 1
+                        "retry_count": state.retry_count + 1,
+                        "failed_tool_call": failed_tool_call
                     }
 
                 return {
@@ -428,18 +456,22 @@ def check_tool_result(state: AgentState):
 
     return {
         "error_type": None,
-        "retry_count": 0
+        "retry_count": 0,
+        "failed_tool_call": None
     }
 
 def after_tool_result(state: AgentState):
 
     if state.error_type == "retry":
-        return "tool"
+        return "retry_tool"
 
     if state.error_type == "agent":
         return "agent"
 
     if state.error_type is None:
+        return "agent"
+
+    if state.error_type == "stop":
         return "agent"
 
     return END
@@ -471,72 +503,68 @@ conn = sqlite3.connect(
 
 checkpointer = SqliteSaver(conn)
 
+# ---------------- GRAPH ----------------
+
 graph = StateGraph(AgentState)
 
-# Nodes
 graph.add_node("agent", agent)
 graph.add_node("tool", tool_node)
 graph.add_node("approval", human_approval)
 graph.add_node("classify_tools", classify_tools)
 graph.add_node("process_approval", process_approval)
 graph.add_node("execute_approved_tool", execute_approved_tool)
-
-# CHANGE:
-# Tool execute hone ke baad uske result/error ko check karenge.
 graph.add_node("check_tool_result", check_tool_result)
+graph.add_node("retry_tool", retry_tool)
 
-# START → AGENT
-graph.add_edge(START, "agent")
+graph.add_edge(START,"agent")
 
-# AGENT ke baad tools ko process karenge
-graph.add_edge("agent", "classify_tools")
+graph.add_edge("agent","classify_tools")
 
 graph.add_conditional_edges(
     "classify_tools",
     should_continue,
     {
-        "approval": "approval",
-        "process": "process_approval",
-        END: END
+        "approval":"approval",
+        "process":"process_approval",
+        END:END
     }
 )
 
-# APPROVAL → PROCESS
-graph.add_edge("approval", "process_approval")
+graph.add_edge("approval","process_approval")
 
 graph.add_conditional_edges(
     "process_approval",
     after_process,
     {
-        "execute": "execute_approved_tool",
-        "approval": "approval",
-        "agent": "agent"
+        "execute":"execute_approved_tool",
+        "approval":"approval",
+        "process":"process_approval",
+        "agent":"agent"
     }
 )
 
-graph.add_edge("execute_approved_tool", "tool")
+graph.add_edge("execute_approved_tool","tool")
 
-# CHANGE:
-# Pehle:
-# tool → agent
-#
-# Ab:
-# tool → check_tool_result
-graph.add_edge("tool", "check_tool_result")
+graph.add_edge("tool","check_tool_result")
 
-# CHANGE:
-# Tool result ke according next node decide hoga.
 graph.add_conditional_edges(
     "check_tool_result",
     after_tool_result,
     {
-        "tool": "tool",
-        "agent": "agent",
-        END: END
+        "retry_tool":"retry_tool",
+        "agent":"agent",
+        END:END
     }
 )
 
-app = graph.compile(checkpointer=checkpointer)
+graph.add_edge("retry_tool","tool")
+
+# ---------------- CHECKPOINTER ----------------
+
+conn = sqlite3.connect("checkpoints.db",check_same_thread=False)
+memory = SqliteSaver(conn)
+
+app = graph.compile(checkpointer=memory)
 # ==========================================================================
 thread_id = str(uuid.uuid4())
 
