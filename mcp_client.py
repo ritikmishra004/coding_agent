@@ -16,11 +16,18 @@ async def main():
             await session.initialize()
 
             tools = await session.list_tools()
+            
 
             print("Available tools:")
 
             for tool in tools.tools:
                 print(tool.name)
+            result = await session.call_tool(
+                "add_numbers",
+                arguments={"a":10,"b":20}
+            )
+
+            print("Result:", result)
 
 if __name__ == "__main__":
     asyncio.run(main())
