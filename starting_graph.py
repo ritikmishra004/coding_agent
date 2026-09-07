@@ -1,0 +1,388 @@
+import uuid
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import BaseMessage,HumanMessage,AIMessage, ToolMessage, SystemMessage
+from pathlib import Path
+from langgraph.graph import StateGraph,START,END
+from typing import Annotated
+from pydantic import BaseModel
+import subprocess
+from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langgraph.prebuilt import ToolNode
+from langgraph.graph.message import add_messages
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+import os
+from langgraph.types import interrupt, Command
+
+@tool
+def list_files()->list[str]:
+    "List all files and folder in the current project directory"
+    files = []
+    for path in Path(".").iterdir():
+        if path.name in [".cenv", "__pycache__", ".git", ".env","checkpoints.db"]:
+            continue
+        else:
+            files.append(path.name)
+    return files
+
+@tool 
+def read_file(file_path: str) -> str:
+    """Read the complete contents of a file."""
+    path = Path(file_path)
+    if not path.is_file():
+        return f"{file_path} is not a file."
+    return path.read_text()
+
+@ tool 
+def write_file(file_path:str,content:str)->str:
+    """Create or overwrite a file with the provided content."""
+    with open(file_path,"w")as file:
+        file.write(content)
+    return f"{file_path} created successfully."
+
+@tool
+def edit_file(file_path,old_text,new_text):
+    """Replace specific existing text in a file with new text."""
+    path = Path(file_path)
+    if not path.is_file():
+        return f"{file_path} is not a file."
+    content = path.read_text()
+    if old_text not in content:
+        return f"{file_path} text not found in it"
+    content = content.replace(old_text,new_text,1)
+    path.write_text(content)
+    return f"{file_path} updated successfully"
+
+@tool
+def command_run(command):
+    """Run a terminal command in the current project directory."""
+    result = subprocess.run(
+        command,
+        shell = True,
+        capture_output=True,
+        text = True
+    )
+    return result.stdout + result.stderr
+
+
+#===========================tools======================================
+tools =[
+    list_files,
+    read_file,
+    write_file,
+    edit_file,
+    command_run
+]
+#===========================LLM======================================
+gemini = ChatGoogleGenerativeAI(
+    model = "gemini-2.5-flash",
+    temperature = 0
+)
+groq = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0
+)
+nvidia=ChatOpenAI(
+    model="openai/gpt-oss-120b",
+    temperature=0,
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=os.getenv("NVIDIA_API_KEY")
+)
+
+gemini = gemini.bind_tools(tools)
+groq = groq.bind_tools(tools)
+nvidia = nvidia.bind_tools(tools)
+#========================= get llm =========================
+
+failed_providers = set()
+def get_llm_response(messages):
+    providers = [("groq",groq),("gemini",gemini),("nvidia",nvidia)]
+    for provider_name,llm in providers:
+
+        # Agar provider pehle hi fail ho chuka hai,
+        # to is baar usko skip kar do
+        if provider_name in failed_providers:
+            print(f"Skipping {provider_name}")
+            continue
+
+        try:
+            #print(f"Trying {provider_name}...")
+            response=llm.invoke(messages)
+            return response
+        except Exception as e:
+            print(f"{provider_name} failed: {e}")
+            # Provider ko failed list mein remember kar lo
+            failed_providers.add(provider_name)
+
+    raise Exception("All LLM providers failed.")
+
+#===================================================================================
+
+class AgentState(BaseModel):
+    messages: Annotated[list[BaseMessage],add_messages]
+    approval: str | None = None
+    pending_tools: list[dict] = []
+    # CHANGE: human ka yes/no decision state mein store hoga.
+    # Approval node decision dega aur after_approval() isi value
+    # ko read karke tool ya agent par route karega.
+
+def agent(state: AgentState):
+    """LLM node that will answer"""
+
+    system_message = SystemMessage(
+        content="""
+You are a coding agent.
+
+When the user asks you to create, write, modify, or save code in a file,
+you MUST use the appropriate file tool instead of only providing the code
+in the chat.
+
+Use:
+- write_file → create a new file or overwrite a file
+- edit_file → modify an existing file
+- read_file → read an existing file
+- list_files → list project files
+- command_run → run terminal commands
+
+For file creation requests, determine the appropriate filename and
+content, then call the required tool.
+"""
+    )
+    # CHANGE: LLM ko coding-agent ka clear instruction de rahe hain.
+    # Pehle LLM user ke request ko sirf "code likhne" ka request samajh
+    # kar code chat mein de raha tha.
+    # Ab usse explicitly bataya hai ki file create/write karne ke liye
+    # actual tool use karna mandatory hai.
+
+    message = [system_message] + state.messages
+    # CHANGE: SystemMessage ko conversation ke beginning mein add kiya.
+    # Isse LLM ko har agent call par ye instruction milega.
+
+    response = get_llm_response(message)
+
+    return {
+        "messages": [response]
+    }
+
+def should_continue(state: AgentState):
+    last_message = state.messages[-1]
+
+    if not last_message.tool_calls:
+        return END
+
+    dangerous_tools = {
+        "write_file",
+        "edit_file",
+        "command_run"
+    }
+
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] in dangerous_tools:
+            return "approval"
+
+    return "tool"
+
+def human_approval(state: AgentState):
+    last_message = state.messages[-1]
+
+    tool_call = last_message.tool_calls[0]
+
+    approval = interrupt(
+        f"""
+Approval required
+Tool: {tool_call["name"]}
+
+Arguments:
+{tool_call["args"]}
+"""
+    )
+
+    if approval.lower() == "yes":
+        return {
+            "approval": "yes"
+        }
+        # CHANGE: yes ko state mein store kar rahe hain.
+        # Isse after_approval() ko pata chalega ki
+        # ToolNode ko execute karna hai.
+
+    return {
+        "approval": "no",
+        "messages": [
+            ToolMessage(
+                content=(
+                    f"The user rejected the execution of "
+                    f"the tool '{tool_call['name']}'. "
+                    "Do not execute this tool call."
+                ),
+                tool_call_id=tool_call["id"]
+            )
+        ]
+    }
+    # CHANGE: no par ToolMessage add kiya.
+    # Agent ko clear result milega ki user ne tool execution reject kiya.
+    # Actual tool execute nahi hoga.
+
+def after_approval(state: AgentState):
+
+    if state.approval.lower() == "yes":
+        return "tool"
+
+    return "agent"
+    # CHANGE: approval ke result ke according routing.
+    # yes → ToolNode
+    # no  → Agent
+
+
+def handle_tool_error(error: Exception) -> str:
+    return f"Tool failed: {str(error)}"
+
+
+tool_node = ToolNode([
+    list_files,
+    read_file,
+    write_file,
+    edit_file,
+    command_run
+    ],
+    handle_tool_errors=handle_tool_error
+)
+
+# ============================================================
+# 7. GRAPH
+# ============================================================
+conn = sqlite3.connect(
+    "checkpoints.db",
+    check_same_thread=False
+)
+checkpointer = SqliteSaver(conn)
+graph = StateGraph(AgentState)
+
+# Nodes
+graph.add_node("agent", agent)
+graph.add_node("tool", tool_node)
+graph.add_node("approval", human_approval)
+
+# START → AGENT
+graph.add_edge(START, "agent")
+# AGENT ke baad decision
+graph.add_conditional_edges("agent", should_continue)
+
+# APPROVAL → TOOL / AGENT
+graph.add_conditional_edges(
+    "approval",
+    after_approval
+)
+# CHANGE: approval ke baad fixed edge nahi hai.
+# yes → tool
+# no → agent
+
+# TOOL → AGENT
+graph.add_edge("tool", "agent")
+
+app = graph.compile(checkpointer=checkpointer)
+# ==========================================================================
+thread_id = str(uuid.uuid4())
+
+config = {
+    "configurable": {
+        "thread_id": thread_id
+    }
+}
+# ==========================================================================
+while True:
+    user_input = input("You: ")
+
+    if user_input.lower() in ["bye","exit","quit"]:
+        break
+    if user_input.lower() == "/new":
+        thread_id = str(uuid.uuid4())
+        config = {
+            "configurable": {
+                "thread_id": thread_id
+            }
+        }
+        # CHANGE: sirf thread_id change karna enough nahi hai.
+        # config mein bhi new thread_id dena zaroori hai,
+        # warna checkpointing purane thread mein hi continue hogi.
+        print("Started a new conversation.")
+        continue
+        # CHANGE: /new ko agent ko user message ki tarah bhejne se rok rahe hain.
+    # Har new user request ke liye providers ko fresh try karenge
+    failed_providers.clear()
+    input_data = {
+        "messages": [
+            HumanMessage(content=user_input)
+        ],
+        "approval": None
+    }
+    # CHANGE: har new user request par approval ko None kar rahe hain.
+    # Previous request ka yes/no next request mein reuse nahi hoga.
+
+    while True:
+
+        interrupted = False
+
+        for chunk in app.stream(
+            input_data,
+            config=config,
+            stream_mode=["messages", "updates"]
+        ):
+
+            mode, data = chunk
+            # =========================
+            # AI MESSAGE STREAM
+            # =========================
+            if mode == "messages":
+
+                message_chunk, metadata = data
+
+                if isinstance(message_chunk, ToolMessage):
+                    continue
+
+                if isinstance(message_chunk, AIMessage):
+                    if message_chunk.content:
+                        print(message_chunk.content,end="",flush=True)
+
+            # =========================
+            # GRAPH UPDATES
+            # =========================
+            elif mode == "updates":
+                update = data
+                if "agent" in update:
+                    message = update["agent"]["messages"][-1]
+                    if isinstance(message, AIMessage):
+                        if message.tool_calls:
+                            for tool_call in message.tool_calls:
+                                print(
+                                    f"\n🔧 Using tool: {tool_call['name']}")
+                # HITL INTERRUPT
+                if "__interrupt__" in update:
+                    interrupted = True
+                    interrupt_data = update["__interrupt__"][0]
+                    print(
+                        f"\n{interrupt_data.value}"
+                    )
+
+        print()
+
+        # =========================
+        # RESUME AFTER APPROVAL
+        # =========================
+        if interrupted:
+            while True:
+                approval = input("Approve? (yes/no): ").strip().lower()
+                if approval in ["yes", "no"]:
+                    break
+                print("Please type yes or no.")
+            # CHANGE: invalid input handle kiya.
+            # Sirf yes/no par hi paused graph resume hoga.
+            input_data = Command(
+                resume=approval
+            )
+            # CHANGE: interrupt() se paused graph ko resume kar rahe hain.
+            # approval value human_approval() ke interrupt() ko return hogi.
+            continue
+
+        break
