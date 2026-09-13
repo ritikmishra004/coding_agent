@@ -17,7 +17,7 @@ from langgraph.types import interrupt,Command
 from mcp import Client,StdioServerParameters
 
 
-#===========================MCP======================================
+# MCP
 
 mcp_server = StdioServerParameters(
     command="python",
@@ -106,7 +106,7 @@ async def discover_mcp_tools():
     return discovered_tools
 
 
-#===========================SCHEMA=================================
+#SCHEMA
 
 # CHANGE:
 # MCP ka JSON input schema LangChain ke Pydantic args schema mein convert karenge.
@@ -181,7 +181,7 @@ def create_mcp_args_schema(tool_name,input_schema):
     )
 
 
-#===========================DYNAMIC TOOLS==========================
+#DYNAMIC TOOLS
 
 def create_mcp_tool(mcp_tool):
     mcp_name = mcp_tool.name
@@ -239,7 +239,7 @@ dangerous_tools = {
 }
 
 
-#===========================LLM=====================================
+#LLM
 
 gemini = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
@@ -288,7 +288,7 @@ def get_llm_response(messages):
     raise Exception("All LLM providers failed.")
 
 
-#===========================STATE==================================
+#STATE
 
 class AgentState(BaseModel):
     messages: Annotated[list[BaseMessage],add_messages]
@@ -300,7 +300,7 @@ class AgentState(BaseModel):
     retry_count: int = 0
 
 
-#===========================AGENT==================================
+#AGENT
 
 def agent(state:AgentState):
     system_message = SystemMessage(
@@ -343,7 +343,7 @@ Do not blindly repeat the failed tool call.
     }
 
 
-#===========================TOOL FLOW===============================
+#TOOL FLOW
 
 def classify_tools(state:AgentState):
     last_message = state.messages[-1]
@@ -440,7 +440,7 @@ def execute_approved_tool(state:AgentState):
     }
 
 
-#===========================ERROR / RETRY===========================
+#ERROR / RETRY
 
 def classify_error(error:Exception)->str:
     if isinstance(error,(TimeoutError,ConnectionError)):
@@ -538,7 +538,7 @@ def handle_tool_error(error:Exception)->str:
     return f"Tool failed: {type(error).__name__}: {str(error)}"
 
 
-#===========================GRAPH===================================
+#GRAPH
 
 tool_node = ToolNode(
     tools,
@@ -607,7 +607,6 @@ graph.add_edge("retry_tool","classify_tools")
 app = graph.compile(checkpointer=memory)
 
 
-#===========================RUN=====================================
 
 thread_id = str(uuid.uuid4())
 
