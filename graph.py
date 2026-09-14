@@ -105,6 +105,28 @@ async def discover_mcp_tools():
 
     return discovered_tools
 
+async def discover_mcp_resources():
+    resources=[]
+    cursor=None
+
+    async with Client(mcp_server) as client:
+        while True:
+            page=await client.list_resources(cursor=cursor)
+            resources.extend(page.resources)
+
+            if page.next_cursor is None:
+                break
+
+            cursor=page.next_cursor
+
+    return resources
+
+
+async def read_mcp_resource(uri):
+    async with Client(mcp_server) as client:
+        result=await client.read_resource(uri)
+        return result
+
 
 #SCHEMA
 
@@ -113,55 +135,39 @@ async def discover_mcp_tools():
 def schema_type(schema,name):
     if not isinstance(schema,dict):
         return Any
-
     if "enum" in schema:
         return str
-
     if "anyOf" in schema or "oneOf" in schema:
         return Any
-
     schema_kind = schema.get("type")
-
     if schema_kind == "string":
         return str
-
     if schema_kind == "integer":
         return int
-
     if schema_kind == "number":
         return float
-
     if schema_kind == "boolean":
         return bool
-
     if schema_kind == "array":
         item_type = schema_type(
             schema.get("items",{}),
             f"{name}Item"
         )
         return list[item_type]
-
     if schema_kind == "object":
         properties = schema.get("properties",{})
         required = set(schema.get("required",[]))
         fields = {}
 
         for field_name,field_schema in properties.items():
-            field_type = schema_type(
-                field_schema,
-                f"{name}_{field_name}"
-            )
-
+            field_type = schema_type(field_schema,f"{name}_{field_name}")
             description = field_schema.get("description")
-
             if field_name in required:
                 default = Field(...,description=description) if description else ...
                 fields[field_name] = (field_type,default)
-
             else:
                 default = Field(None,description=description) if description else None
                 fields[field_name] = (field_type | None,default)
-
         return create_model(name,**fields)
 
     return Any
@@ -215,9 +221,27 @@ def create_mcp_tool(mcp_tool):
     )
 
 
-mcp_tool_definitions = asyncio.run(
+mcp_tool_definitions=asyncio.run(
     discover_mcp_tools()
 )
+
+mcp_resources=asyncio.run(
+    discover_mcp_resources()
+)
+
+print("\nMCP resources discovered:")
+
+for resource in mcp_resources:
+    print(f"- {resource.uri}")
+
+print()
+
+project_files=asyncio.run(
+    read_mcp_resource("project://files")
+)
+
+print("\nProject resource:")
+print(project_files)
 
 tools = [
     create_mcp_tool(mcp_tool)
@@ -237,7 +261,23 @@ dangerous_tools = {
     "mcp_edit_file",
     "mcp_command_run"
 }
+# planner
+planner_gemini = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0
+)
 
+planner_groq = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0
+)
+
+planner_nvidia = ChatOpenAI(
+    model="openai/gpt-oss-120b",
+    temperature=0,
+    base_url="https://integrate.api.nvidia.com/v1",
+    api_key=os.getenv("NVIDIA_API_KEY")
+)
 
 #LLM
 
@@ -272,21 +312,35 @@ def get_llm_response(messages):
         ("gemini",gemini),
         ("nvidia",nvidia)
     ]
-
     for provider_name,llm in providers:
         if provider_name in failed_providers:
             print(f"Skipping {provider_name}")
             continue
-
         try:
             return llm.invoke(messages)
-
         except Exception as e:
             print(f"{provider_name} failed: {e}")
             failed_providers.add(provider_name)
-
     raise Exception("All LLM providers failed.")
 
+# for planner
+def get_planner_response(messages):
+
+    providers = [
+        ("groq",planner_groq),
+        ("gemini",planner_gemini),
+        ("nvidia",planner_nvidia)
+    ]
+
+    for provider_name,llm in providers:
+        if provider_name in failed_providers:
+            print(f"Skipping planner {provider_name}")
+            continue
+        try:
+            return llm.invoke(messages)
+        except Exception as e:
+            print(f"Planner {provider_name} failed: {e}")
+    raise Exception("All planner LLM providers failed.")
 
 #STATE
 
@@ -298,13 +352,98 @@ class AgentState(BaseModel):
     failed_tool_call: dict | None = None
     error_type: str | None = None
     retry_count: int = 0
+    plan: list[str] = Field(default_factory=list)
+    current_step: int = 0
+    verification_result: str | None = None
+    fix_attempts: int = 0
+    verification_mode: bool = False
 
+# planner agent
+#===========================PLANNER================================
+
+def planner(state:AgentState):
+
+    system_message = SystemMessage(
+        content="""
+You are a coding task planner.
+
+Create a concise step-by-step plan for completing the user's coding task.
+
+The plan should normally cover:
+1. Inspect the project and identify relevant files.
+2. Read the relevant code.
+3. Make the required changes.
+4. Run appropriate tests or verification commands.
+5. Fix failures if necessary.
+6. Verify the final result.
+
+Rules:
+- Do not execute any tools.
+- Do not write code.
+- Only create the plan.
+- Return one step per line.
+- Start each step with a number.
+- Do not commit, push, or modify git history unless the user explicitly asks.
+- Do not add unnecessary steps that are not required by the user's task.
+"""
+    )
+
+    response = get_planner_response(
+        [system_message] + state.messages
+    )
+    content = str(response.content).strip()
+    plan = []
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("- "):
+            line = line[2:].strip()
+        elif line.startswith("* "):
+            line = line[2:].strip()
+        else:
+            parts = line.split(".",1)
+            if len(parts) == 2 and parts[0].isdigit():
+                line = parts[1].strip()
+            else:
+                parts = line.split(")",1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    line = parts[1].strip()
+        if line:
+            plan.append(line)
+    if not plan:
+        plan = [
+            "Inspect the project and identify the relevant files.",
+            "Read the relevant code.",
+            "Make the required changes.",
+            "Run appropriate tests or verification commands.",
+            "Fix failures if necessary.",
+            "Verify the final result."
+        ]
+    print("\n📋 Plan:")
+    for index,step in enumerate(plan,start=1):
+        print(f"{index}. {step}")
+    print()
+    return {
+        "plan":plan,
+        "current_step":0
+    }
 
 #AGENT
 
 def agent(state:AgentState):
+
+    plan_text = "\n".join(
+        f"{index}. {step}"
+        for index,step in enumerate(
+            state.plan,
+            start=1
+        )
+    )
+    verification_text = state.verification_result or "Not verified yet."
+
     system_message = SystemMessage(
-        content="""
+        content=f"""
 You are a coding agent.
 
 The MCP tools are discovered dynamically from the MCP server.
@@ -331,13 +470,27 @@ If a tool succeeds, do not repeat the same operation unless the user asks.
 
 If a tool fails, analyze the error before the next action.
 Do not blindly repeat the failed tool call.
+
+================ CURRENT PLAN ================
+
+{plan_text}
+
+===============VERIFICATION RESULT ================
+{verification_text}
+
+Use the plan as guidance while completing the task.
+
+If verification failed, analyze the verification failure,
+identify what needs to be fixed, use the appropriate MCP tools,
+and then make the required changes.
 """
     )
 
-    response = get_llm_response(
-        [system_message] + state.messages
-    )
+    recent_messages = state.messages[-12:]
 
+    response = get_llm_response(
+        [system_message] + recent_messages
+    )
     return {
         "messages":[response]
     }
@@ -346,31 +499,32 @@ Do not blindly repeat the failed tool call.
 #TOOL FLOW
 
 def classify_tools(state:AgentState):
-    last_message = state.messages[-1]
 
+    last_message = state.messages[-1]
     return {
         "pending_tools":last_message.tool_calls
     }
 
 
 def should_continue(state:AgentState):
+
     if not state.pending_tools:
         return END
-
-    if state.pending_tools[0]["name"] in dangerous_tools:
+    next_tool = state.pending_tools[0]["name"]
+    if (state.verification_mode and next_tool == "mcp_command_run"):
+        return "process"
+    if next_tool in dangerous_tools:
         return "approval"
-
     return "process"
 
 
 def human_approval(state:AgentState):
-    tool_call = state.pending_tools[0]
 
+    tool_call = state.pending_tools[0]
     approval = interrupt(
         f"""
 Approval required
 Tool: {tool_call["name"]}
-
 Arguments:
 {tool_call["args"]}
 """
@@ -382,21 +536,25 @@ Arguments:
 
 
 def process_approval(state:AgentState):
+
     tool_call = state.pending_tools[0]
 
+    if (state.verification_mode and tool_call["name"] == "mcp_command_run"):
+        return {
+            "approved_tool":tool_call,
+            "pending_tools":state.pending_tools[1:]
+        }
     if tool_call["name"] not in dangerous_tools:
         return {
             "approved_tool":tool_call,
             "pending_tools":state.pending_tools[1:]
         }
-
     if state.approval == "yes":
         return {
             "approved_tool":tool_call,
             "pending_tools":state.pending_tools[1:],
             "approval":None
         }
-
     rejection_message = ToolMessage(
         content=(
             f"The user rejected the execution of the tool "
@@ -404,7 +562,6 @@ def process_approval(state:AgentState):
         ),
         tool_call_id=tool_call["id"]
     )
-
     return {
         "approved_tool":None,
         "pending_tools":state.pending_tools[1:],
@@ -414,21 +571,25 @@ def process_approval(state:AgentState):
 
 
 def after_process(state:AgentState):
+
     if state.approved_tool:
         return "execute"
-
     if state.pending_tools:
-        if state.pending_tools[0]["name"] in dangerous_tools:
+        next_tool = state.pending_tools[0]["name"]
+        if (
+            state.verification_mode
+            and next_tool == "mcp_command_run"
+        ):
+            return "process"
+        if next_tool in dangerous_tools:
             return "approval"
-
         return "process"
-
     return "agent"
 
 
 def execute_approved_tool(state:AgentState):
-    tool_call = state.approved_tool
 
+    tool_call = state.approved_tool
     return {
         "messages":[
             AIMessage(
@@ -443,12 +604,11 @@ def execute_approved_tool(state:AgentState):
 #ERROR / RETRY
 
 def classify_error(error:Exception)->str:
+
     if isinstance(error,(TimeoutError,ConnectionError)):
         return "retry"
-
     if isinstance(error,(FileNotFoundError,PermissionError,IsADirectoryError)):
         return "agent"
-
     return "stop"
 
 
@@ -466,73 +626,207 @@ def retry_tool(state:AgentState):
 
 
 def check_tool_result(state:AgentState):
-    last_message = state.messages[-1]
-
+    last_message=state.messages[-1]
     if isinstance(last_message,ToolMessage):
-        content = str(last_message.content)
-
+        content=str(last_message.content)
+        failed_tool_call=None
+        for message in reversed(state.messages):
+            if isinstance(message,AIMessage):
+                for tool_call in message.tool_calls:
+                    if tool_call["id"]==last_message.tool_call_id:
+                        failed_tool_call=tool_call
+                        break
+            if failed_tool_call:
+                break
         if content.startswith("Tool failed:"):
-            parts = content.split(":",2)
-            error_name = parts[1].strip() if len(parts) > 1 else "Exception"
-
-            failed_tool_call = None
-
-            for message in reversed(state.messages):
-                if isinstance(message,AIMessage):
-                    for tool_call in message.tool_calls:
-                        if tool_call["id"] == last_message.tool_call_id:
-                            failed_tool_call = tool_call
-                            break
-
-                if failed_tool_call:
-                    break
-
-            error_classes = {
+            parts=content.split(":",2)
+            error_name=parts[1].strip() if len(parts)>1 else "Exception"
+            error_classes={
                 "TimeoutError":TimeoutError,
                 "ConnectionError":ConnectionError,
                 "FileNotFoundError":FileNotFoundError,
                 "PermissionError":PermissionError,
                 "IsADirectoryError":IsADirectoryError
             }
-
-            error = error_classes.get(error_name,Exception)()
-            decision = classify_error(error)
-
-            if decision == "retry":
-                if state.retry_count < 3:
+            error=error_classes.get(error_name,Exception)()
+            decision=classify_error(error)
+            if decision=="retry":
+                if state.retry_count<3:
                     return {
                         "error_type":"retry",
-                        "retry_count":state.retry_count + 1,
+                        "retry_count":state.retry_count+1,
                         "failed_tool_call":failed_tool_call
                     }
-
-                return {
-                    "error_type":"stop"
-                }
-
+                return {"error_type":"stop"}
+            return {"error_type":decision}
+        if state.verification_mode:
             return {
-                "error_type":decision
+                "error_type":None,
+                "retry_count":0,
+                "failed_tool_call":None,
+                "verification_mode":True
             }
-
+        if failed_tool_call:
+            tool_name=failed_tool_call["name"]
+            if state.pending_tools:
+                return {
+                    "error_type":None,
+                    "retry_count":0,
+                    "failed_tool_call":None
+                }
+            if tool_name in {"mcp_write_file","mcp_edit_file"}:
+                return {
+                    "error_type":None,
+                    "retry_count":0,
+                    "failed_tool_call":None,
+                    "verification_mode":True
+                }
     return {
         "error_type":None,
         "retry_count":0,
         "failed_tool_call":None
     }
 
+# verifier
+
+def verifier(state:AgentState):
+
+    if state.verification_mode:
+
+        last_message=state.messages[-1]
+
+        if isinstance(last_message,ToolMessage):
+
+            tool_call_id=last_message.tool_call_id
+            verification_tool=False
+
+            for message in reversed(state.messages):
+                if isinstance(message,AIMessage):
+                    for tool_call in message.tool_calls:
+                        if tool_call["id"]==tool_call_id:
+                            if tool_call["name"]=="mcp_command_run":
+                                verification_tool=True
+                            break
+                if verification_tool:
+                    break
+
+            if verification_tool:
+
+                content=str(last_message.content)
+
+                if content.startswith("Tool failed:"):
+                    return {
+                        "messages":[
+                            AIMessage(
+                                content=f"FAIL: {content}"
+                            )
+                        ],
+                        "verification_result":f"FAIL: {content}"
+                    }
+
+                if any(
+                    indicator in content
+                    for indicator in [
+                        "failed",
+                        "error",
+                        "errors",
+                        "failure",
+                        "FAILED"
+                    ]
+                ):
+                    return {
+                        "messages":[
+                            AIMessage(
+                                content=f"FAIL: {content}"
+                            )
+                        ],
+                        "verification_result":f"FAIL: {content}"
+                    }
+
+                return {
+                    "messages":[
+                        AIMessage(
+                            content=f"PASS: {content}"
+                        )
+                    ],
+                    "verification_result":f"PASS: {content}"
+                }
+
+    system_message=SystemMessage(
+        content="""
+You are a coding task verifier.
+
+Your job is to verify whether the user's requested coding task
+has actually been completed.
+
+You may use these MCP tools for verification:
+- mcp_list_files
+- mcp_read_file
+- mcp_command_run
+
+You must NOT use:
+- mcp_write_file
+- mcp_edit_file
+
+Run exactly one appropriate non-destructive verification command.
+After running a verification command, do not run another verification command.
+
+Once a verification result is available:
+- analyze it
+- do not run the same verification command again
+- return exactly:
+
+PASS: <brief reason>
+
+or
+
+FAIL: <brief reason>
+"""
+    )
+
+    response=get_llm_response(
+        [system_message]+state.messages[-12:]
+    )
+
+    return {
+        "messages":[response]
+    }
 
 def after_tool_result(state:AgentState):
+
     if state.error_type == "retry":
         return "retry_tool"
-
     if state.error_type == "agent":
         return "agent"
-
+    if state.verification_mode:
+        return "verifier"
     if state.error_type in [None,"stop"]:
-        return "agent"
-
+        return "verifier"
     return END
 
+def after_verifier(state:AgentState):
+
+    last_message = state.messages[-1]
+    if isinstance(last_message,AIMessage):
+        if last_message.tool_calls:
+            return "tools"
+        content = str(
+            last_message.content
+        ).strip()
+        if content.startswith("PASS:"):
+            return END
+        if content.startswith("FAIL:"):
+            if state.fix_attempts < 3:
+                return "fix"
+            return END
+    return END
+
+def fix(state:AgentState):
+
+    return {
+        "fix_attempts":state.fix_attempts + 1,
+        "verification_mode":False
+    }
 
 def handle_tool_error(error:Exception)->str:
     return f"Tool failed: {type(error).__name__}: {str(error)}"
@@ -554,7 +848,10 @@ memory = SqliteSaver(conn)
 
 graph = StateGraph(AgentState)
 
+graph.add_node("planner",planner)
 graph.add_node("agent",agent)
+graph.add_node("verifier",verifier)
+graph.add_node("fix",fix)
 graph.add_node("tool",tool_node)
 graph.add_node("approval",human_approval)
 graph.add_node("classify_tools",classify_tools)
@@ -563,7 +860,8 @@ graph.add_node("execute_approved_tool",execute_approved_tool)
 graph.add_node("check_tool_result",check_tool_result)
 graph.add_node("retry_tool",retry_tool)
 
-graph.add_edge(START,"agent")
+graph.add_edge(START,"planner")
+graph.add_edge("planner","agent")
 graph.add_edge("agent","classify_tools")
 
 graph.add_conditional_edges(
@@ -588,26 +886,32 @@ graph.add_conditional_edges(
         "agent":"agent"
     }
 )
-
 graph.add_edge("execute_approved_tool","tool")
 graph.add_edge("tool","check_tool_result")
-
 graph.add_conditional_edges(
     "check_tool_result",
     after_tool_result,
     {
         "retry_tool":"retry_tool",
         "agent":"agent",
+        "verifier":"verifier",
         END:END
     }
 )
-
+graph.add_conditional_edges(
+    "verifier",
+    after_verifier,
+    {
+        "tools":"classify_tools",
+        "fix":"fix",
+        END:END
+    }
+)
+graph.add_edge("fix","agent")
 graph.add_edge("retry_tool","classify_tools")
-
 app = graph.compile(checkpointer=memory)
 
-
-
+#=============================================================
 thread_id = str(uuid.uuid4())
 
 config = {
@@ -645,7 +949,12 @@ while True:
         "approved_tool":None,
         "failed_tool_call":None,
         "error_type":None,
-        "retry_count":0
+        "retry_count":0,
+        "plan":[],
+        "current_step":0,
+        "verification_result":None,
+        "fix_attempts":0,
+        "verification_mode":False
     }
 
     while True:
