@@ -38,7 +38,8 @@ data/
 # Secrets / local files
 secrets/
 
-
+# Local database / generated files
 checkpoints.db
-
+auth.db
+jwt_auth.md
 text.md

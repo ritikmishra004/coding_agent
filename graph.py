@@ -36,18 +36,14 @@ def extract_mcp_result(result):
 
     if isinstance(data,dict) and "result" in data:
         data = data["result"]
-
     if data is not None:
         return data
-
     content = getattr(result,"content",None) or []
-
     texts = []
 
     for item in content:
         if hasattr(item,"text"):
             texts.append(item.text)
-
     if texts:
         return "\n".join(texts)
 
@@ -154,11 +150,11 @@ def schema_type(schema,name):
             f"{name}Item"
         )
         return list[item_type]
+
     if schema_kind == "object":
         properties = schema.get("properties",{})
         required = set(schema.get("required",[]))
         fields = {}
-
         for field_name,field_schema in properties.items():
             field_type = schema_type(field_schema,f"{name}_{field_name}")
             description = field_schema.get("description")
@@ -220,7 +216,6 @@ def create_mcp_tool(mcp_tool):
         args_schema=args_schema
     )
 
-
 mcp_tool_definitions=asyncio.run(discover_mcp_tools())
 
 mcp_resources=asyncio.run(discover_mcp_resources())
@@ -232,12 +227,7 @@ for resource in mcp_resources:
 
 print()
 
-project_files = asyncio.run(
-    read_mcp_resource("project://files")
-)
 
-print("\nProject resource:")
-print(project_files)
 
 tools = []
 for mcp_tool in mcp_tool_definitions:
@@ -257,7 +247,9 @@ dangerous_tools = {
     "mcp_edit_file",
     "mcp_command_run"
 }
-# planner
+
+# PLANNER
+
 planner_gemini = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0
@@ -622,6 +614,7 @@ def retry_tool(state:AgentState):
 
 
 def check_tool_result(state:AgentState):
+
     last_message=state.messages[-1]
     if isinstance(last_message,ToolMessage):
         content=str(last_message.content)
@@ -634,6 +627,7 @@ def check_tool_result(state:AgentState):
                         break
             if failed_tool_call:
                 break
+
         if content.startswith("Tool failed:"):
             parts=content.split(":",2)
             error_name=parts[1].strip() if len(parts)>1 else "Exception"
@@ -646,6 +640,7 @@ def check_tool_result(state:AgentState):
             }
             error=error_classes.get(error_name,Exception)()
             decision=classify_error(error)
+
             if decision=="retry":
                 if state.retry_count<3:
                     return {
@@ -655,6 +650,7 @@ def check_tool_result(state:AgentState):
                     }
                 return {"error_type":"stop"}
             return {"error_type":decision}
+        
         if state.verification_mode:
             return {
                 "error_type":None,
@@ -677,6 +673,7 @@ def check_tool_result(state:AgentState):
                     "failed_tool_call":None,
                     "verification_mode":True
                 }
+            
     return {
         "error_type":None,
         "retry_count":0,
