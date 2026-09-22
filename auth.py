@@ -61,11 +61,9 @@ def create_access_token(user_id):
         algorithm=ALGORITHM
     )
 
-def get_current_user(
-    credentials:HTTPAuthorizationCredentials=Depends(security)
-):
-    token=credentials.credentials
+def get_current_user(credentials:HTTPAuthorizationCredentials=Depends(security)):
 
+    token=credentials.credentials
     try:
         payload=jwt.decode(
             token,
@@ -90,10 +88,7 @@ def get_current_user(
     conn=sqlite3.connect(DB_NAME)
     conn.row_factory=sqlite3.Row
 
-    user=conn.execute(
-        "SELECT id,email FROM users WHERE id=?",
-        (user_id,)
-    ).fetchone()
+    user=conn.execute("SELECT id,email FROM users WHERE id=?",(user_id,)).fetchone()
 
     conn.close()
 
