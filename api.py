@@ -2,7 +2,7 @@ from fastapi import FastAPI,HTTPException,Depends
 from pydantic import BaseModel,EmailStr,Field
 from datetime import datetime,timezone,timedelta
 import sqlite3
-from auth import hash_password,verify_password,generate_otp,create_access_token,get_current_user,DB_NAME
+from auth import hash_password,verify_password,generate_otp,send_otp_email,create_access_token,get_current_user,DB_NAME
 
 app=FastAPI(title="Coding Agent API")
 
@@ -70,7 +70,7 @@ def register(data:AuthRequest):
     conn.commit()
     conn.close()
 
-    print(f"OTP for {data.email}: {otp}")
+    send_otp_email(data.email,otp)
 
     return {
         "message":"Registration successful. Verify your OTP.",

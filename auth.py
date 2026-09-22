@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import secrets
+import resend
 import jwt
 from datetime import datetime,timedelta,timezone
 from dotenv import load_dotenv
@@ -10,6 +11,8 @@ from fastapi.security import HTTPBearer,HTTPAuthorizationCredentials
 from jwt.exceptions import InvalidTokenError
 
 load_dotenv()
+
+resend.api_key=os.getenv("RESEND_API_KEY")
 
 SECRET_KEY=os.getenv("JWT_SECRET_KEY")
 ALGORITHM="HS256"
@@ -44,6 +47,21 @@ def verify_password(password,hashed_password):
 
 def generate_otp():
     return str(secrets.randbelow(900000)+100000)
+
+def send_otp_email(email,otp):
+    params={
+        "from":"Coding Agent <onboarding@resend.dev>",
+        "to":[email],
+        "subject":"Your Coding Agent OTP",
+        "html":f"""
+        <h2>Email Verification</h2>
+        <p>Your OTP is:</p>
+        <h1>{otp}</h1>
+        <p>This OTP is valid for 5 minutes.</p>
+        """
+    }
+
+    return resend.Emails.send(params)
 
 def create_access_token(user_id):
     expire=datetime.now(timezone.utc)+timedelta(
