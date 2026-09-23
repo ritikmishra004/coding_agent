@@ -19,10 +19,55 @@ from mcp import Client,StdioServerParameters
 
 # MCP
 
-mcp_server = StdioServerParameters(
-    command="python",
-    args=["mcp_server.py"]
-)
+def get_project_root():
+    user_id=os.getenv("WORKSPACE_USER_ID")
+
+    if user_id:
+        conn=sqlite3.connect("auth.db")
+
+        workspace=conn.execute(
+            """
+            SELECT workspace_path
+            FROM users
+            WHERE id=?
+            """,
+            (user_id,)
+        ).fetchone()
+
+        conn.close()
+
+        if workspace and workspace[0]:
+            path=workspace[0]
+
+            if not os.path.isdir(path):
+                raise FileNotFoundError(
+                    "Selected workspace folder does not exist."
+                )
+
+            return path
+
+        raise ValueError(
+            "No workspace selected for this user."
+        )
+
+    return os.getenv(
+        "PROJECT_ROOT",
+        os.getcwd()
+    )
+
+
+PROJECT_ROOT=get_project_root()
+
+
+def get_mcp_server():
+    return StdioServerParameters(
+        command="python",
+        args=["mcp_server.py"],
+        env={
+            **os.environ,
+            "PROJECT_ROOT":PROJECT_ROOT
+        }
+    )
 
 
 MCP_ERROR_PREFIX = "__MCP_ERROR_TYPE__:"
@@ -68,8 +113,10 @@ def process_mcp_result(result):
 
 
 async def mcp_call_tool(tool_name,arguments):
+    mcp_server=get_mcp_server()
+
     async with Client(mcp_server) as client:
-        result = await client.call_tool(
+        result=await client.call_tool(
             tool_name,
             arguments
         )
@@ -89,7 +136,7 @@ async def discover_mcp_tools():
     discovered_tools = []
     cursor = None
 
-    async with Client(mcp_server) as client:
+    async with Client(get_mcp_server()) as client:
         while True:
             page = await client.list_tools(cursor=cursor)
             discovered_tools.extend(page.tools)
@@ -105,7 +152,7 @@ async def discover_mcp_resources():
     resources=[]
     cursor=None
 
-    async with Client(mcp_server) as client:
+    async with Client(get_mcp_server()) as client:
         while True:
             page=await client.list_resources(cursor=cursor)
             resources.extend(page.resources)
@@ -119,7 +166,7 @@ async def discover_mcp_resources():
 
 
 async def read_mcp_resource(uri):
-    async with Client(mcp_server) as client:
+    async with Client(get_mcp_server()) as client:
         result=await client.read_resource(uri)
         return result
 

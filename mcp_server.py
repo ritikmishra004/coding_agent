@@ -3,9 +3,32 @@ from pathlib import Path
 import subprocess
 import shlex
 import json
-
+import os
 
 mcp = MCPServer("Coding Agent MCP Server")
+
+PROJECT_ROOT=Path(
+    os.getenv("PROJECT_ROOT",".")
+).expanduser().resolve()
+
+def safe_path(file_path:str)->Path:
+    path=Path(file_path)
+
+    if path.is_absolute():
+        raise PermissionError(
+            "Absolute paths are not allowed."
+        )
+
+    resolved=(PROJECT_ROOT/path).resolve()
+
+    try:
+        resolved.relative_to(PROJECT_ROOT)
+    except ValueError:
+        raise PermissionError(
+            "Access outside the project folder is not allowed."
+        )
+
+    return resolved
 
 
 # CHANGE:
@@ -30,7 +53,7 @@ def list_files()->list[str]:
     try:
         files = []
 
-        for path in Path(".").iterdir():
+        for path in PROJECT_ROOT.iterdir():
             if path.name in [".cenv","__pycache__",".git",".env","checkpoints.db"]:
                 continue
             files.append(path.name)
@@ -45,7 +68,7 @@ def list_files()->list[str]:
 def read_file(file_path:str)->str:
     """Read the complete contents of a file."""
     try:
-        return Path(file_path).read_text()
+        return safe_path(file_path).read_text()
 
     except (FileNotFoundError,PermissionError,IsADirectoryError) as e:
         return mcp_error(e)
@@ -55,7 +78,9 @@ def read_file(file_path:str)->str:
 def write_file(file_path:str,content:str)->str:
     """Create or overwrite a file with the provided content."""
     try:
-        with open(file_path,"w") as file:
+        path=safe_path(file_path)
+
+        with open(path,"w") as file:
             file.write(content)
 
         return f"{file_path} created successfully."
@@ -67,20 +92,20 @@ def write_file(file_path:str,content:str)->str:
 @mcp.tool()
 def edit_file(file_path:str,old_text:str,new_text:str)->str:
     """Replace specific existing text in a file."""
-    path = Path(file_path)
-
-    if not path.is_file():
-        return mcp_error(
-            FileNotFoundError(f"{file_path} does not exist.")
-        )
-
     try:
-        content = path.read_text()
+        path=safe_path(file_path)
+
+        if not path.is_file():
+            return mcp_error(
+                FileNotFoundError(f"{file_path} does not exist.")
+            )
+
+        content=path.read_text()
 
         if old_text not in content:
             return f"{file_path} text not found in it"
 
-        content = content.replace(old_text,new_text,1)
+        content=content.replace(old_text,new_text,1)
         path.write_text(content)
 
         return f"{file_path} updated successfully"
@@ -131,11 +156,12 @@ def command_run(command:str)->str:
             )
 
         result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True
-        )
+                command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                cwd=PROJECT_ROOT
+            )
 
         output = result.stdout + result.stderr
 
@@ -169,7 +195,7 @@ def project_files()->str:
     """Return the current project file list as JSON."""
     files = []
 
-    for path in Path(".").iterdir():
+    for path in PROJECT_ROOT.iterdir():
         if path.name in [".cenv","__pycache__",".git",".env","checkpoints.db"]:
             continue
         files.append(path.name)
@@ -180,7 +206,7 @@ def project_files()->str:
 @mcp.resource("file://{file_path}")
 def file_resource(file_path:str)->str:
     """Read a project file as an MCP resource."""
-    path = Path(file_path)
+    path=safe_path(file_path)
 
     if not path.is_file():
         return mcp_error(

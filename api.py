@@ -1,10 +1,13 @@
 from fastapi import FastAPI,HTTPException,Depends
 from pydantic import BaseModel,EmailStr,Field
 from datetime import datetime,timezone,timedelta
+from pathlib import Path
 import sqlite3
 from auth import hash_password,verify_password,generate_otp,send_otp_email,create_access_token,get_current_user,DB_NAME
 
 app=FastAPI(title="Coding Agent API")
+WORKSPACE_ROOT=Path("workspaces")
+WORKSPACE_ROOT.mkdir(exist_ok=True)
 
 class AuthRequest(BaseModel):
     email:EmailStr
@@ -66,9 +69,11 @@ def register(data:AuthRequest):
     )
 
     user_id=cursor.lastrowid
-
     conn.commit()
     conn.close()
+
+    user_workspace=WORKSPACE_ROOT/str(user_id)
+    user_workspace.mkdir(parents=True,exist_ok=True)
 
     send_otp_email(data.email,otp)
 

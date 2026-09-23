@@ -1,121 +1,325 @@
+from fastapi import FastAPI,HTTPException,Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel,EmailStr,Field
+from datetime import datetime,timezone,timedelta
+from pathlib import Path
 import sqlite3
-import os
-import secrets
-import resend
-import jwt
-from datetime import datetime,timedelta,timezone
-from dotenv import load_dotenv
-from pwdlib import PasswordHash
-from fastapi import HTTPException,Depends
-from fastapi.security import HTTPBearer,HTTPAuthorizationCredentials
-from jwt.exceptions import InvalidTokenError
 
-load_dotenv()
+from auth import (
+    hash_password,
+    verify_password,
+    generate_otp,
+    send_otp_email,
+    create_access_token,
+    get_current_user,
+    DB_NAME
+)
 
-resend.api_key=os.getenv("RESEND_API_KEY")
 
-SECRET_KEY=os.getenv("JWT_SECRET_KEY")
-ALGORITHM="HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES=30
-DB_NAME="auth.db"
+app=FastAPI(title="Coding Agent API")
 
-password_hash=PasswordHash.recommended()
-security=HTTPBearer()
 
-def init_db():
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:3000"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+class AuthRequest(BaseModel):
+    email:EmailStr
+    password:str=Field(min_length=8)
+
+
+class OTPRequest(BaseModel):
+    email:EmailStr
+    otp:str=Field(
+        min_length=6,
+        max_length=6,
+        pattern=r"^\d{6}$"
+    )
+
+
+class WorkspaceRequest(BaseModel):
+    folder_path:str
+
+
+@app.post("/auth/register")
+def register(data:AuthRequest):
+
     conn=sqlite3.connect(DB_NAME)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            is_verified INTEGER DEFAULT 0,
-            otp_hash TEXT,
-            otp_expiry TEXT
+    existing_user=conn.execute(
+        "SELECT id FROM users WHERE email=?",
+        (data.email,)
+    ).fetchone()
+
+    if existing_user:
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Email already registered"
         )
-    """)
+
+    hashed_password=hash_password(data.password)
+
+    otp=generate_otp()
+    otp_hash=hash_password(otp)
+
+    otp_expiry=datetime.now(
+        timezone.utc
+    )+timedelta(minutes=5)
+
+    cursor=conn.execute(
+        """
+        INSERT INTO users(
+            email,
+            password_hash,
+            is_verified,
+            otp_hash,
+            otp_expiry
+        )
+        VALUES(?,?,?,?,?)
+        """,
+        (
+            data.email,
+            hashed_password,
+            0,
+            otp_hash,
+            otp_expiry.isoformat()
+        )
+    )
+
+    user_id=cursor.lastrowid
 
     conn.commit()
     conn.close()
 
-def hash_password(password):
-    return password_hash.hash(password)
-
-def verify_password(password,hashed_password):
-    return password_hash.verify(password,hashed_password)
-
-def generate_otp():
-    return str(secrets.randbelow(900000)+100000)
-
-def send_otp_email(email,otp):
-    params={
-        "from":"Coding Agent <onboarding@resend.dev>",
-        "to":[email],
-        "subject":"Your Coding Agent OTP",
-        "html":f"""
-        <h2>Email Verification</h2>
-        <p>Your OTP is:</p>
-        <h1>{otp}</h1>
-        <p>This OTP is valid for 5 minutes.</p>
-        """
-    }
-
-    return resend.Emails.send(params)
-
-def create_access_token(user_id):
-    expire=datetime.now(timezone.utc)+timedelta(
-        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    send_otp_email(
+        data.email,
+        otp
     )
 
-    payload={
-        "sub":str(user_id),
-        "exp":expire
+    return {
+        "message":"Registration successful. Verify your OTP.",
+        "user_id":user_id
     }
 
-    return jwt.encode(
-        payload,
-        SECRET_KEY,
-        algorithm=ALGORITHM
-    )
 
-def get_current_user(credentials:HTTPAuthorizationCredentials=Depends(security)):
-
-    token=credentials.credentials
-    try:
-        payload=jwt.decode(
-            token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM]
-        )
-
-        user_id=payload.get("sub")
-
-        if user_id is None:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid token"
-            )
-
-    except InvalidTokenError:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token"
-        )
+@app.post("/auth/verify-otp")
+def verify_otp(data:OTPRequest):
 
     conn=sqlite3.connect(DB_NAME)
-    conn.row_factory=sqlite3.Row
 
-    user=conn.execute("SELECT id,email FROM users WHERE id=?",(user_id,)).fetchone()
+    user=conn.execute(
+        """
+        SELECT
+            id,
+            is_verified,
+            otp_hash,
+            otp_expiry
+        FROM users
+        WHERE email=?
+        """,
+        (data.email,)
+    ).fetchone()
+
+    if user is None:
+        conn.close()
+
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    if user[1]:
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Email already verified"
+        )
+
+    if user[3] is None:
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="OTP not found"
+        )
+
+    expiry=datetime.fromisoformat(
+        user[3]
+    )
+
+    if datetime.now(timezone.utc)>expiry:
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="OTP expired"
+        )
+
+    if not verify_password(
+        data.otp,
+        user[2]
+    ):
+        conn.close()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid OTP"
+        )
+
+    conn.execute(
+        """
+        UPDATE users
+        SET
+            is_verified=1,
+            otp_hash=NULL,
+            otp_expiry=NULL
+        WHERE id=?
+        """,
+        (user[0],)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "message":"Email verified successfully"
+    }
+
+
+@app.post("/auth/login")
+def login(data:AuthRequest):
+
+    conn=sqlite3.connect(DB_NAME)
+
+    user=conn.execute(
+        """
+        SELECT
+            id,
+            email,
+            password_hash,
+            is_verified
+        FROM users
+        WHERE email=?
+        """,
+        (data.email,)
+    ).fetchone()
 
     conn.close()
 
     if user is None:
         raise HTTPException(
             status_code=401,
-            detail="User not found"
+            detail="Invalid email or password"
         )
 
-    return dict(user)
+    if not verify_password(
+        data.password,
+        user[2]
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
 
-init_db()
+    if not user[3]:
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email first"
+        )
+
+    token=create_access_token(
+        user[0]
+    )
+
+    return {
+        "access_token":token,
+        "token_type":"bearer"
+    }
+
+
+@app.get("/auth/me")
+def me(
+    user=Depends(get_current_user)
+):
+    return user
+
+
+@app.post("/workspace/select")
+def select_workspace(
+    data:WorkspaceRequest,
+    user=Depends(get_current_user)
+):
+    path=Path(
+        data.folder_path
+    ).expanduser().resolve()
+
+    if not path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="Folder does not exist"
+        )
+
+    if not path.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail="Selected path is not a folder"
+        )
+
+    conn=sqlite3.connect(DB_NAME)
+
+    conn.execute(
+        """
+        UPDATE users
+        SET workspace_path=?
+        WHERE id=?
+        """,
+        (
+            str(path),
+            user["id"]
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "message":"Workspace selected successfully",
+        "workspace_path":str(path)
+    }
+
+
+@app.get("/workspace")
+def get_workspace(
+    user=Depends(get_current_user)
+):
+    conn=sqlite3.connect(DB_NAME)
+
+    workspace=conn.execute(
+        """
+        SELECT workspace_path
+        FROM users
+        WHERE id=?
+        """,
+        (user["id"],)
+    ).fetchone()
+
+    conn.close()
+
+    return {
+        "workspace_path":(
+            workspace[0]
+            if workspace
+            else None
+        )
+    }
