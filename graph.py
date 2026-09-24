@@ -2,6 +2,8 @@ import uuid
 import asyncio
 import sqlite3
 import os
+import sys
+from pathlib import Path
 from typing import Annotated,Any
 from pydantic import BaseModel,Field,create_model
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -15,60 +17,103 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import interrupt,Command
 from mcp import Client,StdioServerParameters
+from contextvars import ContextVar
+
+current_user_id=ContextVar(
+    "current_user_id",
+    default=None
+)
 
 
 # MCP
 
-def get_project_root():
-    user_id=os.getenv("WORKSPACE_USER_ID")
+current_workspace_path=ContextVar(
+    "current_workspace_path",
+    default=None
+)
 
-    if user_id:
-        conn=sqlite3.connect("auth.db")
+current_progress_callback=ContextVar(
+    "current_progress_callback",
+    default=None
+)
 
-        workspace=conn.execute(
-            """
-            SELECT workspace_path
-            FROM users
-            WHERE id=?
-            """,
-            (user_id,)
-        ).fetchone()
 
-        conn.close()
+def report_progress(message,**kwargs):
 
-        if workspace and workspace[0]:
-            path=workspace[0]
+    callback=current_progress_callback.get()
 
-            if not os.path.isdir(path):
-                raise FileNotFoundError(
-                    "Selected workspace folder does not exist."
-                )
+    if callback is None:
+        return
 
-            return path
+    progress={
+        "message":message,
+        **kwargs
+    }
 
-        raise ValueError(
-            "No workspace selected for this user."
+    try:
+        callback(progress)
+    except Exception:
+        pass
+
+
+def get_workspace_path(user_id):
+
+    local_workspace=current_workspace_path.get()
+
+    if local_workspace:
+        workspace_path=os.path.abspath(
+            os.path.expanduser(local_workspace)
         )
 
-    return os.getenv(
-        "PROJECT_ROOT",
-        os.getcwd()
-    )
+        if not os.path.isdir(workspace_path):
+            raise FileNotFoundError(
+                "Selected workspace folder does not exist."
+            )
+
+        return workspace_path
+
+    conn=sqlite3.connect("auth.db")
+
+    workspace=conn.execute(
+        "SELECT workspace_path FROM users WHERE id=?",
+        (user_id,)
+    ).fetchone()
+
+    conn.close()
+
+    if workspace is None:
+        raise ValueError("User not found.")
+
+    if not workspace[0]:
+        raise ValueError("No workspace selected for this user.")
+
+    workspace_path=workspace[0]
+
+    if not os.path.isdir(workspace_path):
+        raise FileNotFoundError(
+            "Selected workspace folder does not exist."
+        )
+
+    return workspace_path
 
 
-PROJECT_ROOT=get_project_root()
+def get_mcp_server(user_id):
 
+    project_root=get_workspace_path(user_id)
+    server_path=Path(__file__).resolve().parent/"mcp_server.py"
 
-def get_mcp_server():
+    if not server_path.is_file():
+        raise FileNotFoundError("mcp_server.py was not found.")
+
     return StdioServerParameters(
-        command="python",
-        args=["mcp_server.py"],
+        command=sys.executable,
+        args=[str(server_path)],
         env={
             **os.environ,
-            "PROJECT_ROOT":PROJECT_ROOT
-        }
+            "PROJECT_ROOT":project_root
+        },
+        cwd=project_root
     )
-
 
 MCP_ERROR_PREFIX = "__MCP_ERROR_TYPE__:"
 
@@ -109,13 +154,39 @@ def process_mcp_result(result):
     if result.is_error:
         return f"Tool failed: Exception: {data}"
 
-    return data
+    if isinstance(data,str):
+        return data
+
+    try:
+        import json
+        return json.dumps(data,ensure_ascii=False)
+    except Exception:
+        return str(data)
+
+
+def get_runtime_user_id():
+
+    user_id=current_user_id.get()
+
+    if user_id is not None:
+        return int(user_id)
+
+    env_user_id=os.getenv("WORKSPACE_USER_ID")
+
+    if env_user_id:
+        return int(env_user_id)
+
+    raise RuntimeError("User identity is missing.")
 
 
 async def mcp_call_tool(tool_name,arguments):
-    mcp_server=get_mcp_server()
+
+    user_id=get_runtime_user_id()
+
+    mcp_server=get_mcp_server(user_id)
 
     async with Client(mcp_server) as client:
+
         result=await client.call_tool(
             tool_name,
             arguments
@@ -132,11 +203,26 @@ def call_mcp_tool(tool_name,arguments):
 
 #===========================MCP DISCOVERY===========================
 
+def get_mcp_server_for_discovery():
+    project_root=Path(__file__).resolve().parent
+    server_path=project_root/"mcp_server.py"
+
+    return StdioServerParameters(
+        command=sys.executable,
+        args=[str(server_path)],
+        env={
+            **os.environ,
+            "PROJECT_ROOT":str(project_root)
+        },
+        cwd=str(project_root)
+    )
+
+
 async def discover_mcp_tools():
     discovered_tools = []
     cursor = None
 
-    async with Client(get_mcp_server()) as client:
+    async with Client(get_mcp_server_for_discovery()) as client:
         while True:
             page = await client.list_tools(cursor=cursor)
             discovered_tools.extend(page.tools)
@@ -152,7 +238,7 @@ async def discover_mcp_resources():
     resources=[]
     cursor=None
 
-    async with Client(get_mcp_server()) as client:
+    async with Client(get_mcp_server_for_discovery()) as client:
         while True:
             page=await client.list_resources(cursor=cursor)
             resources.extend(page.resources)
@@ -166,7 +252,10 @@ async def discover_mcp_resources():
 
 
 async def read_mcp_resource(uri):
-    async with Client(get_mcp_server()) as client:
+
+    user_id=get_runtime_user_id()
+
+    async with Client(get_mcp_server(user_id)) as client:
         result=await client.read_resource(uri)
         return result
 
@@ -338,7 +427,19 @@ groq = groq.bind_tools(tools)
 nvidia = nvidia.bind_tools(tools)
 
 
-failed_providers = set()
+failed_providers=ContextVar(
+    "failed_providers",
+    default=None
+)
+
+def get_failed_providers():
+    providers=failed_providers.get()
+
+    if providers is None:
+        providers=set()
+        failed_providers.set(providers)
+
+    return providers
 
 
 def get_llm_response(messages):
@@ -347,15 +448,20 @@ def get_llm_response(messages):
         ("gemini",gemini),
         ("nvidia",nvidia)
     ]
+
+    failed=get_failed_providers()
+
     for provider_name,llm in providers:
-        if provider_name in failed_providers:
+        if provider_name in failed:
             print(f"Skipping {provider_name}")
             continue
+
         try:
             return llm.invoke(messages)
         except Exception as e:
             print(f"{provider_name} failed: {e}")
-            failed_providers.add(provider_name)
+            failed.add(provider_name)
+
     raise Exception("All LLM providers failed.")
 
 # for planner
@@ -367,14 +473,19 @@ def get_planner_response(messages):
         ("nvidia",planner_nvidia)
     ]
 
+    failed=get_failed_providers()
+
     for provider_name,llm in providers:
-        if provider_name in failed_providers:
+        if provider_name in failed:
             print(f"Skipping planner {provider_name}")
             continue
+
         try:
             return llm.invoke(messages)
         except Exception as e:
             print(f"Planner {provider_name} failed: {e}")
+            failed.add(provider_name)
+
     raise Exception("All planner LLM providers failed.")
 
 #STATE
@@ -459,6 +570,12 @@ Rules:
     for index,step in enumerate(plan,start=1):
         print(f"{index}. {step}")
     print()
+
+    report_progress(
+        "Plan created.",
+        plan=plan
+    )
+
     return {
         "plan":plan,
         "current_step":0
@@ -523,6 +640,12 @@ and then make the required changes.
 
     recent_messages = state.messages[-12:]
 
+    report_progress(
+        "Agent is analyzing the task.",
+        plan=state.plan,
+        verification_result=state.verification_result
+    )
+
     response = get_llm_response(
         [system_message] + recent_messages
     )
@@ -536,8 +659,22 @@ and then make the required changes.
 def classify_tools(state:AgentState):
 
     last_message = state.messages[-1]
+    pending_tools=last_message.tool_calls
+
+    if pending_tools:
+        report_progress(
+            "Tool call requested.",
+            tool_calls=[
+                {
+                    "name":tool_call["name"],
+                    "args":tool_call.get("args",{})
+                }
+                for tool_call in pending_tools
+            ]
+        )
+
     return {
-        "pending_tools":last_message.tool_calls
+        "pending_tools":pending_tools
     }
 
 
@@ -555,15 +692,21 @@ def should_continue(state:AgentState):
 
 def human_approval(state:AgentState):
 
-    tool_call = state.pending_tools[0]
-    approval = interrupt(
-        f"""
-Approval required
-Tool: {tool_call["name"]}
-Arguments:
-{tool_call["args"]}
-"""
+    tool_call=state.pending_tools[0]
+
+    approval_request=(
+        f"Approval required\n"
+        f"Tool: {tool_call["name"]}\n"
+        f"Arguments:\n{tool_call["args"]}"
     )
+
+    report_progress(
+        "Approval required.",
+        tool=tool_call["name"],
+        approval_request=approval_request
+    )
+
+    approval=interrupt(approval_request)
 
     return {
         "approval":approval
@@ -624,7 +767,14 @@ def after_process(state:AgentState):
 
 def execute_approved_tool(state:AgentState):
 
-    tool_call = state.approved_tool
+    tool_call=state.approved_tool
+
+    report_progress(
+        "Executing approved tool.",
+        tool=tool_call["name"],
+        args=tool_call.get("args",{})
+    )
+
     return {
         "messages":[
             AIMessage(
@@ -675,7 +825,15 @@ def check_tool_result(state:AgentState):
             if failed_tool_call:
                 break
 
+        tool_name=failed_tool_call["name"] if failed_tool_call else None
+
         if content.startswith("Tool failed:"):
+            report_progress(
+                "Tool failed.",
+                tool=tool_name,
+                error=content
+            )
+
             parts=content.split(":",2)
             error_name=parts[1].strip() if len(parts)>1 else "Exception"
             error_classes={
@@ -699,6 +857,11 @@ def check_tool_result(state:AgentState):
             return {"error_type":decision}
         
         if state.verification_mode:
+            report_progress(
+                "Verification tool completed.",
+                tool=tool_name,
+                result=content
+            )
             return {
                 "error_type":None,
                 "retry_count":0,
@@ -731,6 +894,12 @@ def check_tool_result(state:AgentState):
 
 def verifier(state:AgentState):
 
+    report_progress(
+        "Verifying the result.",
+        plan=state.plan,
+        fix_attempts=state.fix_attempts
+    )
+
     if state.verification_mode:
         last_message=state.messages[-1]
         if isinstance(last_message,ToolMessage):
@@ -741,7 +910,11 @@ def verifier(state:AgentState):
                 if isinstance(message,AIMessage):
                     for tool_call in message.tool_calls:
                         if tool_call["id"]==tool_call_id:
-                            if tool_call["name"]=="mcp_command_run":
+                            if tool_call["name"] in {
+                                "mcp_list_files",
+                                "mcp_read_file",
+                                "mcp_command_run"
+                            }:
                                 verification_tool=True
                             break
                 if verification_tool:
@@ -860,6 +1033,11 @@ def after_verifier(state:AgentState):
 
 def fix(state:AgentState):
 
+    report_progress(
+        "Fixing the verification failure.",
+        attempt=state.fix_attempts+1
+    )
+
     return {
         "fix_attempts":state.fix_attempts + 1,
         "verification_mode":False
@@ -949,35 +1127,13 @@ graph.add_edge("retry_tool","classify_tools")
 app = graph.compile(checkpointer=memory)
 
 #=============================================================
-thread_id = str(uuid.uuid4())
 
-config = {
-    "configurable":{
-        "thread_id":thread_id
-    }
-}
+def make_thread_key(user_id,thread_id):
+    return f"user:{user_id}:thread:{thread_id}"
 
 
-while True:
-    user_input = input("You: ")
-
-    if user_input.lower() in ["bye","exit","quit"]:
-        break
-
-    if user_input.lower() == "/new":
-        thread_id = str(uuid.uuid4())
-        config = {
-            "configurable":{
-                "thread_id":thread_id
-            }
-        }
-
-        print("Started a new conversation.")
-        continue
-
-    failed_providers.clear()
-
-    input_data = {
+def build_input_data(user_input):
+    return {
         "messages":[
             HumanMessage(content=user_input)
         ],
@@ -994,60 +1150,122 @@ while True:
         "verification_mode":False
     }
 
-    while True:
-        interrupted = False
 
-        for chunk in app.stream(
-            input_data,
-            config=config,
-            stream_mode=["messages","updates"]
-        ):
-            mode,data = chunk
+def get_last_response(config):
+    state=app.get_state(config)
+    messages=state.values.get("messages",[])
 
-            if mode == "messages":
-                message_chunk,metadata = data
+    for message in reversed(messages):
+        if isinstance(message,AIMessage):
+            if message.tool_calls:
+                continue
 
-                if isinstance(message_chunk,ToolMessage):
+            if message.content:
+                return str(message.content)
+
+    return ""
+def run_agent(
+    user_id,
+    thread_id=None,
+    user_input=None,
+    approval=None,
+    workspace_path=None,
+    progress_callback=None
+):
+
+    user_id=int(user_id)
+
+    runtime_user_id=os.getenv("WORKSPACE_USER_ID")
+    runtime_workspace=os.getenv("PROJECT_ROOT")
+
+    workspace_token=None
+    progress_token=None
+
+    if workspace_path is not None:
+        workspace_token=current_workspace_path.set(
+            workspace_path
+        )
+
+    runtime_workspace_path=get_workspace_path(user_id)
+
+    os.environ["WORKSPACE_USER_ID"]=str(user_id)
+    os.environ["PROJECT_ROOT"]=runtime_workspace_path
+
+    if progress_callback is not None:
+        progress_token=current_progress_callback.set(
+            progress_callback
+        )
+
+    try:
+        get_workspace_path(user_id)
+
+        if thread_id is None:
+            thread_id=str(uuid.uuid4())
+
+        config={
+            "configurable":{
+                "thread_id":make_thread_key(user_id,thread_id)
+            }
+        }
+
+        user_token=current_user_id.set(user_id)
+        provider_token=failed_providers.set(set())
+
+        try:
+            if approval is not None:
+                input_data=Command(resume=approval)
+            elif user_input is not None:
+                input_data=build_input_data(user_input)
+            else:
+                raise ValueError("Either user_input or approval is required.")
+
+            interrupted=False
+            approval_request=None
+
+            for chunk in app.stream(
+                input_data,
+                config=config,
+                stream_mode=["messages","updates"]
+            ):
+                mode,data=chunk
+
+                if mode != "updates":
                     continue
 
-                if isinstance(message_chunk,AIMessage):
-                    if message_chunk.content:
-                        print(
-                            message_chunk.content,
-                            end="",
-                            flush=True
-                        )
+                if "__interrupt__" in data:
+                    interrupted=True
+                    interrupt_data=data["__interrupt__"][0]
+                    approval_request=str(interrupt_data.value)
 
-            elif mode == "updates":
-                update = data
+            response=get_last_response(config)
+            state=app.get_state(config)
 
-                if "execute_approved_tool" in update:
-                    tool_data = update["execute_approved_tool"]
-                    message = tool_data["messages"][0]
+            return {
+                "thread_id":thread_id,
+                "response":response,
+                "approval_required":interrupted,
+                "approval_request":approval_request,
+                "plan":state.values.get("plan",[])
+            }
 
-                    if isinstance(message,AIMessage):
-                        for tool_call in message.tool_calls:
-                            print(
-                                f"\n🔧 Using tool: {tool_call['name']}"
-                            )
+        finally:
+            failed_providers.reset(provider_token)
+            current_user_id.reset(user_token)
 
-                if "__interrupt__" in update:
-                    interrupted = True
-                    interrupt_data = update["__interrupt__"][0]
-                    print(interrupt_data.value)
+    finally:
 
-        print()
+        if runtime_user_id is None:
+            os.environ.pop("WORKSPACE_USER_ID",None)
+        else:
+            os.environ["WORKSPACE_USER_ID"]=runtime_user_id
 
-        if interrupted:
-            while True:
-                approval = input("Approve? (yes/no): ").strip().lower()
+        if runtime_workspace is None:
+            os.environ.pop("PROJECT_ROOT",None)
+        else:
+            os.environ["PROJECT_ROOT"]=runtime_workspace
 
-                if approval in ["yes","no"]:
-                    break
+        if workspace_token is not None:
+            current_workspace_path.reset(workspace_token)
 
-                print("Please type yes or no.")
-
-            input_data = Command(resume=approval)
-            continue
-
-        break
+        if progress_token is not None:
+            current_progress_callback.reset(progress_token)
