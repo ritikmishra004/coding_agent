@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pydantic[email]
+pwdlib[argon2]
+resend
+PyJWT
+python-dotenv
+streamlit
+requests
+langchain-google-genai
+langchain-groq
+langchain-openai
+langchain-core
+langgraph
+langgraph-checkpoint-sqlite
+mcp

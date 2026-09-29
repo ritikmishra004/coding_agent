@@ -1,3 +1,5 @@
+import os
+import sys
 import subprocess
 from pathlib import Path
 import time
@@ -11,7 +13,7 @@ st.set_page_config(
 )
 
 
-DEFAULT_API_URL="http://127.0.0.1:8000"
+DEFAULT_API_URL=os.getenv("API_URL","http://127.0.0.1:8000")
 
 
 if "api_url" not in st.session_state:
