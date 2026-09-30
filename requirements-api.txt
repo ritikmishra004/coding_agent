@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic[email]
+pwdlib[argon2]
+resend
+PyJWT
+python-dotenv
