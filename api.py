@@ -421,18 +421,12 @@ def select_workspace(
     data:WorkspaceRequest,
     user=Depends(get_current_user)
 ):
-    path=Path(data.folder_path).expanduser().resolve()
+    folder_path=data.folder_path.strip()
 
-    if not path.exists():
+    if not folder_path:
         raise HTTPException(
             status_code=400,
-            detail="Folder does not exist"
-        )
-
-    if not path.is_dir():
-        raise HTTPException(
-            status_code=400,
-            detail="Selected path is not a folder"
+            detail="Folder path cannot be empty"
         )
 
     conn=sqlite3.connect(DB_NAME)
@@ -443,7 +437,7 @@ def select_workspace(
         SET workspace_path=?
         WHERE id=?
         """,
-        (str(path),user["id"])
+        (folder_path,user["id"])
     )
 
     conn.commit()
@@ -451,7 +445,7 @@ def select_workspace(
 
     return {
         "message":"Workspace selected successfully",
-        "workspace_path":str(path)
+        "workspace_path":folder_path
     }
 
 
