@@ -1152,17 +1152,47 @@ def build_input_data(user_input):
 
 
 def get_last_response(config):
+
     state=app.get_state(config)
-    messages=state.values.get("messages",[])
+    messages=state.values.get(
+        "messages",
+        [])
+    verification_response=None
+    tool_result=None
 
     for message in reversed(messages):
+
         if isinstance(message,AIMessage):
             if message.tool_calls:
                 continue
 
             if message.content:
-                return str(message.content)
+                content=str(
+                    message.content
+                ).strip()
+                if content.startswith(
+                    ("PASS:","FAIL:")
+                ):
 
+                    if verification_response is None:
+                        verification_response=content
+                    continue
+                return content
+        elif isinstance(message,ToolMessage):
+            content=str(
+                message.content
+            ).strip()
+            if content and tool_result is None:
+                tool_result=content
+    if tool_result:
+        if verification_response:
+            return (
+                f"{tool_result}\n\n"
+                f"Verification: {verification_response}"
+            )
+        return tool_result
+    if verification_response:
+        return verification_response
     return ""
 def run_agent(
     user_id,

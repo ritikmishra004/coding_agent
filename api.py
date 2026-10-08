@@ -8,16 +8,7 @@ import uuid
 import json
 from typing import Literal
 
-from auth import (
-    hash_password,
-    verify_password,
-    generate_otp,
-    send_otp_email,
-    create_access_token,
-    get_current_user,
-    DB_NAME
-)
-
+from auth import hash_password,verify_password,generate_otp,send_otp_email,create_access_token,get_current_user,DB_NAME
 
 
 app=FastAPI(title="Coding Agent API")
