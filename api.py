@@ -108,33 +108,22 @@ def get_chat_history(user_id):
           AND task_type IN ('chat','approve')
         ORDER BY created_at ASC
         """,
-        (user_id,)
-    ).fetchall()
+        (user_id,)).fetchall()
 
     conn.close()
-
     chats={}
-
     for row in rows:
 
         payload=json.loads(row[2])
         result=json.loads(row[3]) if row[3] else {}
-
         thread_id=payload.get("thread_id")
-
         if not thread_id:
             continue
 
         if thread_id not in chats:
-
-            workspace_path=payload.get(
-                "workspace_path"
-            )
-
+            workspace_path=payload.get("workspace_path")
             workspace_name="Coding Agent"
-
             if workspace_path:
-
                 workspace_name=Path(
                     workspace_path
                 ).name
@@ -150,11 +139,9 @@ def get_chat_history(user_id):
         chat["updated_at"]=row[5]
 
         if row[1]=="chat":
-
             message=payload.get("message")
 
             if message:
-
                 chat["messages"].append(
                     {
                         "role":"user",
@@ -163,11 +150,8 @@ def get_chat_history(user_id):
                 )
 
         elif row[1]=="approve":
-
             approval=payload.get("approval")
-
             if approval:
-
                 chat["messages"].append(
                     {
                         "role":"user",
@@ -181,7 +165,6 @@ def get_chat_history(user_id):
         response=result.get("response")
 
         if response:
-
             chat["messages"].append(
                 {
                     "role":"assistant",
@@ -191,12 +174,8 @@ def get_chat_history(user_id):
 
         if result.get("approval_required"):
 
-            approval_request=result.get(
-                "approval_request"
-            )
-
+            approval_request=result.get("approval_request")
             if approval_request:
-
                 chat["messages"].append(
                     {
                         "role":"assistant",
@@ -223,20 +202,16 @@ class OTPRequest(BaseModel):
         pattern=r"^\d{6}$"
     )
 
-
 class WorkspaceRequest(BaseModel):
     folder_path:str
-
 
 class AgentRequest(BaseModel):
     message:str=Field(min_length=1)
     thread_id:str|None=None
 
-
 class ApprovalRequest(BaseModel):
     thread_id:str
     approval:Literal["yes","no"]
-
 
 @app.post("/auth/register")
 def register(data:AuthRequest):
@@ -244,22 +219,16 @@ def register(data:AuthRequest):
 
     existing_user=conn.execute(
         "SELECT id FROM users WHERE email=?",
-        (data.email,)
-    ).fetchone()
+        (data.email,)).fetchone()
 
     if existing_user:
         conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Email already registered"
-        )
+        raise HTTPException(status_code=400,detail="Email already registered")
 
     hashed_password=hash_password(data.password)
     otp=generate_otp()
     otp_hash=hash_password(otp)
-    otp_expiry=(
-        datetime.now(timezone.utc)+timedelta(minutes=5)
-    )
+    otp_expiry=(datetime.now(timezone.utc)+timedelta(minutes=5))
 
     cursor=conn.execute(
         """
@@ -461,18 +430,12 @@ def get_workspace(user=Depends(get_current_user)):
 
 
 @app.get("/agent/chats")
-def agent_chats(
-    user=Depends(get_current_user)
-):
+def agent_chats(user=Depends(get_current_user)):
 
-    chats=get_chat_history(
-        user["id"]
-    )
-
+    chats=get_chat_history(user["id"])
     summaries=[]
 
     for chat in reversed(chats):
-
         summaries.append(
             {
                 "thread_id":chat["thread_id"],
@@ -490,35 +453,22 @@ def agent_chats(
 
 
 @app.get("/agent/chats/{thread_id}")
-def agent_chat_history(
-    thread_id:str,
-    user=Depends(get_current_user)
-):
+def agent_chat_history(thread_id:str,user=Depends(get_current_user)):
 
-    chats=get_chat_history(
-        user["id"]
-    )
+    chats=get_chat_history(user["id"])
 
     for chat in chats:
-
         if chat["thread_id"]==thread_id:
-
             return chat
 
-    raise HTTPException(
-        status_code=404,
-        detail="Chat not found"
-    )
+    raise HTTPException(status_code=404,detail="Chat not found")
 
 @app.post("/agent/chat")
-def agent_chat(
-    data:AgentRequest,
-    user=Depends(get_current_user)
-):
+def agent_chat(data:AgentRequest,user=Depends(get_current_user)):
+
     thread_id=data.thread_id or str(uuid.uuid4())
 
     conn=sqlite3.connect(DB_NAME)
-
     workspace=conn.execute(
         """
         SELECT workspace_path
@@ -531,15 +481,10 @@ def agent_chat(
     conn.close()
 
     if not workspace or not workspace[0]:
-        raise HTTPException(
-            status_code=400,
-            detail="Please select a workspace first"
-        )
+        raise HTTPException(status_code=400,detail="Please select a workspace first")
 
     workspace_path=workspace[0]
-
     workspace_name=Path(workspace_path).name
-
     task_id=create_agent_task(
         user["id"],
         "chat",
@@ -559,15 +504,11 @@ def agent_chat(
     }
 
 @app.get("/agent/task/{task_id}")
-def agent_task_status(
-    task_id:str,
-    user=Depends(get_current_user)
-):
+def agent_task_status(task_id:str,user=Depends(get_current_user)):
     task=get_user_task(user["id"],task_id)
 
     if task is None:
         raise HTTPException(status_code=404,detail="Task not found")
-
     progress=json.loads(task[4]) if task[4] else None
     result=json.loads(task[5]) if task[5] else None
 
@@ -581,10 +522,7 @@ def agent_task_status(
 
 
 @app.post("/agent/approve")
-def agent_approve(
-    data:ApprovalRequest,
-    user=Depends(get_current_user)
-):
+def agent_approve(data:ApprovalRequest,user=Depends(get_current_user)):
     task_id=create_agent_task(
         user["id"],
         "approve",
@@ -602,14 +540,11 @@ def agent_approve(
 
 
 @app.get("/local-agent/tasks/next")
-def local_agent_next_task(
-    user=Depends(get_current_user)
-):
+def local_agent_next_task(user=Depends(get_current_user)):
     conn=sqlite3.connect(DB_NAME)
 
     try:
         conn.execute("BEGIN IMMEDIATE")
-
         task=conn.execute(
             """
             SELECT id,task_type,payload
@@ -624,7 +559,6 @@ def local_agent_next_task(
         if task is None:
             conn.commit()
             return {"task":None}
-
         now=datetime.now(timezone.utc).isoformat()
         conn.execute(
             """
@@ -647,43 +581,29 @@ def local_agent_next_task(
     finally:
         conn.close()
 
-
 class AgentTaskProgress(BaseModel):
     progress:dict
 
 
 @app.post("/local-agent/tasks/{task_id}/progress")
-def local_agent_task_progress(
-    task_id:str,
-    data:AgentTaskProgress,
-    user=Depends(get_current_user)
-):
+def local_agent_task_progress(task_id:str,data:AgentTaskProgress,user=Depends(get_current_user)):
     conn=sqlite3.connect(DB_NAME)
 
-    task=conn.execute(
-        "SELECT progress FROM agent_tasks WHERE id=? AND user_id=?",
-        (task_id,user["id"])
-    ).fetchone()
+    task=conn.execute("SELECT progress FROM agent_tasks WHERE id=? AND user_id=?",
+        (task_id,user["id"])).fetchone()
 
     if task is None:
         conn.close()
-        raise HTTPException(
-            status_code=404,
-            detail="Task not found"
-        )
+        raise HTTPException(status_code=404,detail="Task not found")
 
     existing_progress=json.loads(task[0]) if task[0] else {}
 
     if not isinstance(existing_progress,dict):
         existing_progress={}
-
     events=existing_progress.get("events",[])
-
     if not isinstance(events,list):
         events=[]
-
     events.append(data.progress)
-
     merged_progress={
         **existing_progress,
         **data.progress,
@@ -705,7 +625,6 @@ def local_agent_task_progress(
             user["id"]
         )
     )
-
     conn.commit()
     conn.close()
 
@@ -718,17 +637,12 @@ class AgentTaskResult(BaseModel):
 
 
 @app.post("/local-agent/tasks/{task_id}/result")
-def local_agent_task_result(
-    task_id:str,
-    data:AgentTaskResult,
-    user=Depends(get_current_user)
-):
+def local_agent_task_result(task_id:str,data:AgentTaskResult,user=Depends(get_current_user)):
     conn=sqlite3.connect(DB_NAME)
 
     task=conn.execute(
         "SELECT id FROM agent_tasks WHERE id=? AND user_id=?",
-        (task_id,user["id"])
-    ).fetchone()
+        (task_id,user["id"])).fetchone()
 
     if task is None:
         conn.close()

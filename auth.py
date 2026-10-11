@@ -53,23 +53,14 @@ def init_db():
 
 
 def hash_password(password):
-
     return password_hash.hash(password)
 
-
 def verify_password(password,hashed_password):
-
-    return password_hash.verify(
-        password,
-        hashed_password
-    )
+    return password_hash.verify(password,hashed_password)
 
 
 def generate_otp():
-
-    return str(
-        secrets.randbelow(900000)+100000
-    )
+    return str(secrets.randbelow(900000)+100000)
 
 
 def send_otp_email(email,otp):
@@ -91,51 +82,32 @@ def send_otp_email(email,otp):
 
 def create_access_token(user_id):
 
-    expire=(
-        datetime.now(timezone.utc)
-        +
-        timedelta(
-            minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-        )
-    )
+    expire=(datetime.now(timezone.utc)+
+        timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
 
-    payload={
-        "sub":str(user_id),
-        "exp":expire
-    }
-
-    return jwt.encode(
-        payload,
-        SECRET_KEY,
-        algorithm=ALGORITHM
-    )
+    payload={"sub":str(user_id),"exp":expire}
+    return jwt.encode(payload,SECRET_KEY,algorithm=ALGORITHM)
 
 
-def get_current_user(
-    credentials:HTTPAuthorizationCredentials=Depends(security)
-):
+def get_current_user(credentials:HTTPAuthorizationCredentials=Depends(security)):
 
     token=credentials.credentials
 
     try:
-
         payload=jwt.decode(
             token,
             SECRET_KEY,
             algorithms=[ALGORITHM]
         )
-
         user_id=payload.get("sub")
 
         if user_id is None:
-
             raise HTTPException(
                 status_code=401,
                 detail="Invalid token"
             )
 
     except InvalidTokenError:
-
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired token"
@@ -146,8 +118,7 @@ def get_current_user(
     conn.row_factory=sqlite3.Row
 
     user=conn.execute(
-        "SELECT id,email FROM users WHERE id=?",
-        (user_id,)
+        "SELECT id,email FROM users WHERE id=?",(user_id,)
     ).fetchone()
 
     conn.close()
@@ -160,6 +131,5 @@ def get_current_user(
         )
 
     return dict(user)
-
 
 init_db()

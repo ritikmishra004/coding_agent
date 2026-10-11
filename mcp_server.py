@@ -15,30 +15,18 @@ PROJECT_ROOT=Path(
 def safe_path(file_path:str)->Path:
 
     path=Path(file_path)
-
     if path.is_absolute():
-
-        raise PermissionError(
-            "Absolute paths are not allowed."
-        )
-
+        raise PermissionError("Absolute paths are not allowed.")
     resolved=(PROJECT_ROOT/path).resolve()
 
     try:
-
         resolved.relative_to(PROJECT_ROOT)
-
     except ValueError:
-
-        raise PermissionError(
-            "Access outside the project folder is not allowed."
-        )
-
+        raise PermissionError("Access outside the project folder is not allowed.")
     return resolved
 
 
 MCP_ERROR_PREFIX="__MCP_ERROR_TYPE__:"
-
 
 def mcp_error(error:Exception)->str:
 
@@ -53,31 +41,15 @@ def mcp_error(error:Exception)->str:
 def list_files()->list[str]:
 
     """List all files and folders in the current project directory."""
-
     try:
-
         files=[]
-
         for path in PROJECT_ROOT.iterdir():
-
-            if path.name in [
-                ".cenv",
-                "__pycache__",
-                ".git",
-                ".env",
-                "checkpoints.db"
-            ]:
+            if path.name in [".cenv","__pycache__",".git",".env","checkpoints.db"]:
                 continue
-
             files.append(path.name)
-
         return files
 
-    except (
-        PermissionError,
-        FileNotFoundError
-    ) as e:
-
+    except (PermissionError,FileNotFoundError) as e:
         return mcp_error(e)
 
 
@@ -85,112 +57,43 @@ def list_files()->list[str]:
 def read_file(file_path:str)->str:
 
     """Read the complete contents of a file."""
-
     try:
-
-        return safe_path(
-            file_path
-        ).read_text()
-
-    except (
-        FileNotFoundError,
-        PermissionError,
-        IsADirectoryError
-    ) as e:
-
+        return safe_path(file_path).read_text()
+    except (FileNotFoundError,PermissionError,IsADirectoryError) as e:
         return mcp_error(e)
 
 
 @mcp.tool()
-def write_file(
-    file_path:str,
-    content:str
-)->str:
+def write_file(file_path:str,content:str)->str:
 
     """Create or overwrite a file with the provided content."""
-
     try:
-
-        path=safe_path(
-            file_path
-        )
-
-        with open(
-            path,
-            "w"
-        ) as file:
-
-            file.write(
-                content
-            )
-
-        return (
-            f"{file_path} created successfully."
-        )
-
-    except (
-        FileNotFoundError,
-        PermissionError,
-        IsADirectoryError
-    ) as e:
-
+        path=safe_path(file_path)
+        with open(path,"w") as file:
+            file.write(content)
+        return (f"{file_path} created successfully.")
+    except (FileNotFoundError,PermissionError,IsADirectoryError) as e:
         return mcp_error(e)
 
 
 @mcp.tool()
-def edit_file(
-    file_path:str,
-    old_text:str,
-    new_text:str
-)->str:
-
+def edit_file(file_path:str,old_text:str,new_text:str)->str:
     """Replace specific existing text in a file."""
-
     try:
-
-        path=safe_path(
-            file_path
-        )
+        path=safe_path(file_path)
 
         if not path.is_file():
-
-            return mcp_error(
-                FileNotFoundError(
-                    f"{file_path} does not exist."
-                )
-            )
-
+            return mcp_error(FileNotFoundError(f"{file_path} does not exist."))
         content=path.read_text()
-
         if old_text not in content:
+            return (f"{file_path} text not found in it")
+        content=content.replace(old_text,new_text,1)
+        path.write_text(content)
+        return (f"{file_path} updated successfully")
 
-            return (
-                f"{file_path} text not found in it"
-            )
-
-        content=content.replace(
-            old_text,
-            new_text,
-            1
-        )
-
-        path.write_text(
-            content
-        )
-
-        return (
-            f"{file_path} updated successfully"
-        )
-
-    except (
-        FileNotFoundError,
-        PermissionError,
-        IsADirectoryError
-    ) as e:
-
+    except (FileNotFoundError,PermissionError,IsADirectoryError) as e:
         return mcp_error(e)
-
-
+    
 ALLOWED_COMMANDS={
     "ls",
     "pwd",
@@ -215,43 +118,19 @@ ALLOWED_COMMANDS={
 
 
 def allowed_command(command:str)->bool:
-
     try:
-
-        parts=shlex.split(
-            command
-        )
-
+        parts=shlex.split(command)
         if not parts:
-
             return False
-
         base_command=parts[0]
-
         if base_command=="git":
-
             if len(parts)<2:
-
                 return False
+            return (f"git {parts[1]}"in {"git status","git diff","git log","git branch","git switch"})
 
-            return (
-                f"git {parts[1]}"
-                in {
-                    "git status",
-                    "git diff",
-                    "git log",
-                    "git branch",
-                    "git switch"
-                }
-            )
-
-        return (
-            base_command
-            in ALLOWED_COMMANDS
-        )
+        return (base_command in ALLOWED_COMMANDS)
 
     except ValueError:
-
         return False
 
 
@@ -262,9 +141,7 @@ def command_run(command:str)->str:
 
     try:
 
-        if not allowed_command(
-            command
-        ):
+        if not allowed_command(command):
 
             return (
                 f"Command rejected by security policy: {command}\n"
@@ -280,27 +157,13 @@ def command_run(command:str)->str:
             cwd=PROJECT_ROOT
         )
 
-        output=(
-            result.stdout
-            +
-            result.stderr
-        )
+        output=(result.stdout+result.stderr)
 
         if output:
-
             return output
+        return (f"Command executed successfully: {command}")
 
-        return (
-            f"Command executed successfully: {command}"
-        )
-
-    except (
-        FileNotFoundError,
-        PermissionError,
-        TimeoutError,
-        ConnectionError
-    ) as e:
-
+    except (FileNotFoundError,PermissionError,TimeoutError,ConnectionError) as e:
         return mcp_error(e)
 
 
@@ -309,21 +172,12 @@ def test_retry_error()->str:
 
     """Testing tool for retry error handling."""
 
-    return mcp_error(
-        TimeoutError(
-            "Temporary timeout for testing retry logic."
-        )
-    )
+    return mcp_error(TimeoutError("Temporary timeout for testing retry logic."))
 
 
 @mcp.tool()
-def add_numbers(
-    a:int,
-    b:int
-)->int:
-
+def add_numbers(a:int,b:int)->int:
     """Add two numbers."""
-
     return a+b
 
 
@@ -333,45 +187,25 @@ def add_numbers(
 def project_files()->str:
 
     """Return the current project file list as JSON."""
-
     files=[]
 
     for path in PROJECT_ROOT.iterdir():
-
-        if path.name in [
-            ".cenv",
-            "__pycache__",
-            ".git",
-            ".env",
-            "checkpoints.db"
-        ]:
+        if path.name in [".cenv","__pycache__",".git",".env","checkpoints.db"]:
             continue
-
-        files.append(
-            path.name
-        )
-
-    return json.dumps(
-        files
-    )
+        files.append(path.name)
+    return json.dumps(files)
 
 
 @mcp.resource("file://{file_path}")
 def file_resource(file_path:str)->str:
 
     """Read a project file as an MCP resource."""
-
-    path=safe_path(
-        file_path
-    )
-
+    path=safe_path(file_path)
     if not path.is_file():
-
         return mcp_error(
             FileNotFoundError(
                 f"{file_path} does not exist."
-            )
-        )
+            ))
 
     return path.read_text()
 
@@ -382,7 +216,6 @@ def file_resource(file_path:str)->str:
 def coding_assistant(task:str)->str:
 
     """Create a reusable coding-agent prompt for a task."""
-
     return (
         "You are a coding agent.\n\n"
         f"User task:\n{task}\n\n"
